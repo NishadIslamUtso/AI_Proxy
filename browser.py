@@ -114,19 +114,18 @@ class BrainBrowser:
 
     # ---------- lifecycle ----------
 
-    async def _fit_window(self):
-        """Place the OS window where the whole page is on screen.
+    def _place_window(self):
+        """Put the OS window somewhere sensible, once, at launch.
 
-        Brave restores its last bounds from the profile, which can leave the
-        window larger than the display or half off it, so the composer ends up
-        below the fold. Resizing via set_viewport_size is not usable here: it
-        resizes the window too, so the next measurement is larger still.
+        The page itself is fluid (no_viewport), so this is only a starting
+        position: the user can move and resize the window freely afterwards.
         """
         try:
             import ctypes
             import subprocess
 
             user32 = ctypes.windll.user32
+
             class RECT(ctypes.Structure):
                 _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
                             ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
@@ -138,8 +137,8 @@ class BrainBrowser:
             if screen_w <= 0 or screen_h <= 0:
                 return
 
-            target_w, target_h = 1300, 700           # matches the launch viewport
-            win_w, win_h = target_w + 32, target_h + 44
+            win_w = min(1280, screen_w)
+            win_h = min(760, screen_h)
             x = max(0, (screen_w - win_w) // 2)
             y = max(0, screen_h - win_h)
 
@@ -165,10 +164,10 @@ class BrainBrowser:
                 return
             hwnd = int(out2.strip())
             user32.MoveWindow(hwnd, x, y, win_w, win_h, True)
-            print(f"[brain-proxy] {self.name} window placed at {x},{y} "
-                  f"({target_w}x{target_h})", flush=True)
+            print(f"[brain-proxy] window placed at {x},{y} ({win_w}x{win_h})",
+                  flush=True)
         except Exception as e:  # noqa: BLE001
-            print(f"[brain-proxy] {self.name} fit failed: {e}", flush=True)
+            print(f"[brain-proxy] place failed: {e}", flush=True)
 
     async def _page_alive(self, page, timeout=4.0):
         try:
@@ -199,16 +198,15 @@ class BrainBrowser:
                     user_data_dir=self.user_data_dir,
                     headless=False,
                     executable_path=self.executable_path or None,
-                    args=["--disable-blink-features=AutomationControlled",
-                          "--window-size=1300,740",
-                          "--window-position=0,0"],
-                    viewport={"width": 1300, "height": 700},
+                    no_viewport=True,
+                    args=["--disable-blink-features=AutomationControlled"],
                 )
                 await self._context.add_init_script(
                     "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
                 )
                 _SHARED["ctx"] = self._context
                 _SHARED["pw"] = self._pw
+                self._place_window()
 
         ctx = self._context
         if self.session_url:
@@ -785,7 +783,6 @@ class BrainBrowser:
                 raise BrainError(classify(e), f"{type(e).__name__}: {e}", self.name)
 
             await self._guard_ui()
-            await self._fit_window()
             before = await self._body_text()
 
             # per-task thread: same task keeps its conversation, a new task
