@@ -70,6 +70,8 @@ class BrainBrowser:
         self.done_when_gone = cfg.get("done_when_gone") or []
         self.mode = cfg.get("mode", "chat")
         self.agent_deadline = cfg.get("agent_deadline", 900)
+        self.min_gap = float(cfg.get("min_gap_seconds", 3))
+        self.last_send = 0.0
         self.auth_urls = cfg.get("auth_urls", [])
         self.auth_selectors = cfg.get("auth_selectors", [])
         self.strip_patterns = cfg.get("strip_patterns") or []
@@ -378,6 +380,10 @@ class BrainBrowser:
         return (await el.inner_text()) or ""
 
     async def _type_and_send(self, el, prompt):
+        _gap = time.time() - self.last_send
+        if _gap < self.min_gap:
+            await asyncio.sleep(self.min_gap - _gap + random.uniform(0, 2))
+        self.last_send = time.time()
         await self._dismiss_safe_dialogs()
         await el.click()
         await self._page.keyboard.press("Control+A")

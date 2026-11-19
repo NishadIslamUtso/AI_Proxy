@@ -47,7 +47,7 @@ brains:
     done_when_gone:
       - "button[data-testid='stop-button']"
   arena-chat:
-    url: "arena.ai/chat"
+    url: "https://arena.ai/chat"
     input_selectors:
       - ".tiptap.ProseMirror"
       - "div.tiptap[contenteditable='true']"

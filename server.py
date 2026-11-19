@@ -60,6 +60,17 @@ def record(brain, code, ms, attempt=0, ok=False):
         s["fail"] += 1
         s["codes"][code] = s["codes"].get(code, 0) + 1
 
+def reply_looks_like_tool_json(reply):
+    s = (reply or "").strip()
+    if not s.startswith("{"):
+        return False
+    try:
+        obj = json.loads(s)
+    except Exception:
+        return False
+    return isinstance(obj, dict) and ("tool" in obj or "final" in obj)
+
+
 ROLE_MARKERS = (
     "[SYSTEM]", "[USER]", "[ASSISTANT]", "[TOOL RESULT]",
     "--- CONVERSATION ---", "--- END ---", "[BRAIN PROXY]",
@@ -417,6 +428,40 @@ async def debug_google(brain: str):
         await page.close()
 
 
+@app.get("/debug/tool-test")
+async def tool_test(brain: str):
+    if brain not in CFG["brains"]:
+        return JSONResponse(status_code=404, content={"error": "unknown brain"})
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }]
+    messages = [{
+        "role": "user",
+        "content": "What is the weather in Tokyo? Use the get_weather tool.",
+    }]
+    try:
+        b = await get_browser(brain)
+        prompt = build_prompt(brain, messages, tools, CFG.get("tool_truncation", {}))
+        reply = await asyncio.wait_for(b.ask(prompt), timeout=300)
+        return {
+            "brain": brain,
+            "looks_like_json": reply_looks_like_tool_json(reply),
+            "reply_head": reply[:300],
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"error": f"{type(e).__name__}: {e}"})
+
+
 @app.get("/debug/selfcheck")
 async def selfcheck(brain: str = None):
     """Prove each brain can still complete a real turn."""
@@ -645,6 +690,20 @@ async def chat_completions(request: Request):
         return JSONResponse(status_code=502, content=as_openai_error(code, str(e)))
     finally:
         _ACTIVE_N["n"] -= 1
+
+    if body.get("tools") and not reply_looks_like_tool_json(reply):
+        retry_prompt = (
+            "Your previous reply was prose. You must reply with "
+            "exactly one JSON object on its own: "
+            '{"tool": "<name>", "args": {...}} or {"final": "..."}. '
+            "Do not add any other text before or after. Retry for: "
+            + content_to_text(messages[-1].get("content", ""))
+        )
+        try:
+            _r = await brain_call(served or model_name, retry_prompt)
+            reply = _r[0] if isinstance(_r, tuple) else _r
+        except Exception:
+            pass
 
     parsed = parse_tool_reply(sanitize(reply))
     usage = {

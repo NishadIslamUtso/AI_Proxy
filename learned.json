@@ -8,5 +8,15 @@
     "session_url": "https://chatgpt.com/c/6afddb07-a398-83ee-b963-c1947cc06008",
     "input": [],
     "response": []
+  },
+  "arena-chat": {
+    "session_url": "https://arena.ai/chat",
+    "input": [],
+    "response": []
+  },
+  "arena-agent": {
+    "session_url": "https://arena.ai/agent/01a1f2fa-d6af-7afa-a8ec-a87cf0c3799e",
+    "input": [],
+    "response": []
   }
 }
