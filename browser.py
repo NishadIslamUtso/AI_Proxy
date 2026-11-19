@@ -31,6 +31,8 @@ AGENT_STATUS = ("orchestrating", "thinking", "working", "planning",
                 "searching", "analyzing", "running", "starting")
 AGENT_ERROR = ("something went wrong", "please try again",
                "error occurred", "failed to generate")
+RATE_LIMIT = ("daily usage limit", "reached your daily", "usage limit reached",
+              "please try again in")
 
 BRAIN_PREAMBLE = (
     "[BRAIN PROXY]\n"
@@ -241,6 +243,9 @@ class BrainBrowser:
                                   "verify you are human", "access denied")):
             raise BrainError("captcha", f"{self.name} hit a challenge page: {title}",
                              self.name)
+        hit = await self._find_text(RATE_LIMIT)
+        if hit:
+            raise BrainError("rate_limited", f"{self.name}: {hit}", self.name)
         try:
             if any(u in self._page.url for u in AUTH_URLS):
                 raise BrainError("auth_wall", f"{self.name} is at {self._page.url}",
@@ -531,7 +536,16 @@ class BrainBrowser:
         paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
         if len(paras) >= 2:
             opener = paras[0].lower()
-            if re.match(r"^(we need|the user (wants|asked|is)|i should|i need|okay,? |alright,? |let me)", opener):
+            strip_it = bool(re.match(
+                r"^(we need|the user (wants|asked|is)|the task (is|changed|now|was|has)"
+                r"|the request is|same task|i should|i need|okay,? |alright,? |let me)",
+                opener))
+            if not strip_it and len(paras[0]) < 160:
+                # "Same task: reply exactly X" / "Task: answer with Y"
+                strip_it = bool(
+                    re.match(r"^(the )?(task|request|goal|instruction|same task)", opener)
+                    and re.search(r"(reply|answer|exactly|instead|now)", opener))
+            if strip_it:
                 paras = paras[1:]
             text = "\n\n".join(paras)
 
