@@ -114,6 +114,62 @@ class BrainBrowser:
 
     # ---------- lifecycle ----------
 
+    async def _fit_window(self):
+        """Place the OS window where the whole page is on screen.
+
+        Brave restores its last bounds from the profile, which can leave the
+        window larger than the display or half off it, so the composer ends up
+        below the fold. Resizing via set_viewport_size is not usable here: it
+        resizes the window too, so the next measurement is larger still.
+        """
+        try:
+            import ctypes
+            import subprocess
+
+            user32 = ctypes.windll.user32
+            class RECT(ctypes.Structure):
+                _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                            ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+            work = RECT()
+            user32.SystemParametersInfoA(0x0030, 0, ctypes.byref(work), 0)
+            screen_w = work.right - work.left
+            screen_h = work.bottom - work.top
+            if screen_w <= 0 or screen_h <= 0:
+                return
+
+            target_w, target_h = 1300, 700           # matches the launch viewport
+            win_w, win_h = target_w + 32, target_h + 44
+            x = max(0, (screen_w - win_w) // 2)
+            y = max(0, screen_h - win_h)
+
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_Process -Filter \"name='brave.exe'\" | "
+                 "Where-Object { $_.CommandLine -like '*brain-proxy*profile*' } | "
+                 "Select-Object -First 1 -ExpandProperty ProcessId"],
+                capture_output=True, text=True, timeout=20).stdout.strip()
+            pid = None
+            for line in out.splitlines():
+                if line.strip().isdigit():
+                    pid = int(line.strip())
+                    break
+            if not pid:
+                return
+            out2 = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-Process -Id %d -ErrorAction SilentlyContinue).MainWindowHandle"
+                 % pid],
+                capture_output=True, text=True, timeout=20).stdout.strip()
+            if not out2.strip().isdigit():
+                return
+            hwnd = int(out2.strip())
+            user32.MoveWindow(hwnd, x, y, win_w, win_h, True)
+            print(f"[brain-proxy] {self.name} window placed at {x},{y} "
+                  f"({target_w}x{target_h})", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[brain-proxy] {self.name} fit failed: {e}", flush=True)
+
     async def _page_alive(self, page, timeout=4.0):
         try:
             await asyncio.wait_for(page.evaluate("() => 1"), timeout=timeout)
@@ -143,8 +199,10 @@ class BrainBrowser:
                     user_data_dir=self.user_data_dir,
                     headless=False,
                     executable_path=self.executable_path or None,
-                    args=["--disable-blink-features=AutomationControlled"],
-                    viewport={"width": 1280, "height": 900},
+                    args=["--disable-blink-features=AutomationControlled",
+                          "--window-size=1300,740",
+                          "--window-position=0,0"],
+                    viewport={"width": 1300, "height": 700},
                 )
                 await self._context.add_init_script(
                     "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
@@ -727,6 +785,7 @@ class BrainBrowser:
                 raise BrainError(classify(e), f"{type(e).__name__}: {e}", self.name)
 
             await self._guard_ui()
+            await self._fit_window()
             before = await self._body_text()
 
             # per-task thread: same task keeps its conversation, a new task

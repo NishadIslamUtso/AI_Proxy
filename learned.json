@@ -1,6 +1,6 @@
 {
   "zai": {
-    "session_url": "https://chat.z.ai/c/c3fddffa-8cd5-4123-8e5d-cf09cc6e5e58",
+    "session_url": "https://chat.z.ai/c/22810601-b987-465c-80e9-b0b4fe1c87db",
     "input": [],
     "response": []
   },
@@ -16,6 +16,11 @@
   },
   "arena-agent": {
     "session_url": "https://arena.ai/agent/01a1f2fa-d6af-7afa-a8ec-a87cf0c3799e",
+    "input": [],
+    "response": []
+  },
+  "deepseek": {
+    "session_url": "https://chat.deepseek.com/a/chat/s/ec62decc-d5cb-4b78-8758-d9ba97203143",
     "input": [],
     "response": []
   }
