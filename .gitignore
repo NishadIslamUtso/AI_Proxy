@@ -10,3 +10,4 @@ last-tools-block.txt
 *.lnk
 telemetry.jsonl
 shot*.png
+profile/
