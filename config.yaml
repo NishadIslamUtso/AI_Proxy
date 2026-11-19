@@ -123,3 +123,28 @@ brains:
       - "button[aria-label*='Stop']"
       - "button[aria-label*='Cancel']"
       - "[data-state='streaming']"
+  deepseek:
+    url: "https://chat.deepseek.com/"
+    mode: chat
+    input_selectors:
+      - "#chat-input"
+      - "textarea[placeholder*='Send a message']"
+      - "textarea[data-testid='chat-input']"
+      - "div[contenteditable][role='textbox']"
+      - "textarea"
+    response_selectors:
+      - ".ds-markdown"
+      - "[class*='markdown']"
+      - "div[class*='message']"
+    submit_selectors:
+      - "button[aria-label*='Send']"
+      - "button[type='submit']"
+      - "div[role='button'][aria-label*='Send']"
+    submit_key: "Enter"
+    done_when_gone: []
+    auth_urls:
+      - "/sign_in"
+      - "/signin"
+    auth_selectors:
+      - "button:has-text('Log in')"
+      - "a[href*='sign_in']"

@@ -13,7 +13,8 @@ class BrainError(RuntimeError):
 
 
 # Worth retrying immediately (usually a stale tab or a dropped socket).
-TRANSIENT = {"upstream_offline", "cdp_dead", "tab_dead", "send_failed", "no_reply"}
+TRANSIENT = {"upstream_offline", "cdp_dead", "tab_dead", "send_failed",
+             "no_reply", "site_error"}
 
 # Retrying will not help; the human has to do something or the brain must be skipped.
 FAIL_FAST = {"auth_wall", "captcha", "rate_limited", "site_changed", "user_tab_busy",

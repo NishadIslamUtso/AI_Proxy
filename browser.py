@@ -27,6 +27,11 @@ CONTINUE_HINTS = (
     "would you like me to",
 )
 
+AGENT_STATUS = ("orchestrating", "thinking", "working", "planning",
+                "searching", "analyzing", "running", "starting")
+AGENT_ERROR = ("something went wrong", "please try again",
+               "error occurred", "failed to generate")
+
 BRAIN_PREAMBLE = (
     "[BRAIN PROXY]\n"
     "You are the reasoning engine inside an agent framework. Your reply is used "
@@ -59,6 +64,9 @@ class BrainBrowser:
         self.submit_key = cfg.get("submit_key", "Enter")
         self.done_when_gone = cfg.get("done_when_gone") or []
         self.mode = cfg.get("mode", "chat")
+        self.agent_deadline = cfg.get("agent_deadline", 900)
+        self.auth_urls = cfg.get("auth_urls", [])
+        self.auth_selectors = cfg.get("auth_selectors", [])
         self.file_input_selectors = cfg.get("file_input_selectors") or ["input[type='file']"]
 
         self.cdp_url = browser_cfg["cdp_url"]
@@ -308,6 +316,100 @@ class BrainBrowser:
         if btn:
             await btn.click()
 
+    async def _composer_ready(self):
+        for sel in self.input_selectors:
+            loc = self._page.locator(sel)
+            for i in range(await loc.count()):
+                el = loc.nth(i)
+                if not (await el.is_visible() and await el.is_enabled()):
+                    continue
+                ident = ((await el.get_attribute("id") or "") +
+                         (await el.get_attribute("class") or "")).lower()
+                if "recaptcha" in ident or "hidden" in ident:
+                    continue
+                return el
+        return None
+
+    async def _composer_text(self, el):
+        tag = (await el.evaluate("e => e.tagName")).lower()
+        if tag in ("textarea", "input"):
+            return (await el.input_value()) or ""
+        return (await el.inner_text()) or ""
+
+    async def _type_and_send(self, el, prompt):
+        await el.click()
+        await self._page.keyboard.press("Control+A")
+        await self._page.keyboard.press("Delete")
+        tag = (await el.evaluate("e => e.tagName")).lower()
+        if tag in ("textarea", "input"):
+            await el.fill(prompt)
+        else:
+            await self._page.keyboard.insert_text(prompt)
+        await asyncio.sleep(0.3)
+        if not (await self._composer_text(el)).strip():
+            raise BrainError("send_failed", "composer empty after typing", self.name)
+        await self._page.keyboard.press(self.submit_key or "Enter")
+        for _ in range(6):
+            await asyncio.sleep(0.5)
+            if not (await self._composer_text(el)).strip():
+                return
+        btn = await self._first(self.submit_selectors, timeout=1000)
+        if btn:
+            await btn.click()
+            await asyncio.sleep(1)
+            if not (await self._composer_text(el)).strip():
+                return
+        await self._page.evaluate(
+            "() => { const f = document.querySelector('form'); if (f) f.requestSubmit(); }"
+        )
+        await asyncio.sleep(1)
+        if (await self._composer_text(el)).strip():
+            raise BrainError("send_failed", "could not submit", self.name)
+
+    def _is_status(self, text):
+        t = (text or "").strip().lower()
+        return len(t) < 60 and any(w in t for w in AGENT_STATUS)
+
+    async def _find_text(self, needles):
+        body = (await self._body_text()).lower()
+        for n in needles:
+            if n in body:
+                return n
+        return None
+
+    async def _last_assistant_text(self):
+        for sel in self.response_selectors:
+            try:
+                loc = self._page.locator(sel)
+                n = await loc.count()
+                if n:
+                    return (await loc.nth(n - 1).inner_text()).strip()
+            except Exception:
+                continue
+        return ""
+
+    async def _wait_agent(self, before_text):
+        deadline = time.time() + getattr(self, "agent_deadline", 900)
+        last_text, stable = before_text, 0
+        while time.time() < deadline:
+            await asyncio.sleep(2)
+            err = await self._find_text(AGENT_ERROR)
+            if err:
+                raise BrainError("site_error", err, self.name)
+            stop = await self._first(self.done_when_gone, timeout=500)
+            now = await self._body_text()
+            if now == last_text:
+                stable += 1
+            else:
+                stable, last_text = 0, now
+            if stop is None and stable >= 2:
+                last = await self._last_assistant_text()
+                if last and not self._is_status(last):
+                    return
+            if stable >= 5 and not self._is_status(await self._last_assistant_text()):
+                return
+        raise BrainError("agent_timeout", "agent did not finish", self.name)
+
     async def _wait_reply(self, before_text):
         if self.mode == "agent":
             deadline = time.time() + 900
@@ -364,9 +466,10 @@ class BrainBrowser:
                 try:
                     loc = self._page.locator(sel)
                     n = await loc.count()
-                    if n:
-                        text = (await loc.nth(n - 1).inner_text()).strip()
-                        return self._clean(text)
+                    for i in range(n - 1, -1, -1):
+                        text = (await loc.nth(i).inner_text()).strip()
+                        if text and not self._is_status(text):
+                            return self._clean(text)
                 except Exception:
                     continue
             return ""
@@ -574,38 +677,41 @@ class BrainBrowser:
                     except Exception as e:  # noqa: BLE001
                         raise BrainError(classify(e), str(e), self.name)
 
-            el = await self._first(self.input_selectors, timeout=30000)
-            if el is None and await self._heal():
-                el = await self._first(self.input_selectors, timeout=5000)
-            if el is None:
-                raise BrainError("no_reply", f"no composer on {self._page.url}", self.name)
-
-            try:
-                cur = (await el.evaluate(
-                    "e => (e.innerText || e.value || e.textContent || '').trim()")) or ""
-            except Exception:
-                cur = ""
-            if cur.strip():
-                raise BrainError("user_tab_busy",
-                                 f"{self.name}: composer already has text", self.name)
-
             self._marker = f"BR{uuid.uuid4().hex[:8].upper()}"
             note = ""
             if files:
                 note = ("\n\n[attachments uploaded: "
                         + ", ".join(os.path.basename(f) for f in files) + "]")
+
+            el = await self._composer_ready()
+            if el is None:
+                raise BrainError("no_reply", f"no composer on {self._page.url}", self.name)
+            if (await self._composer_text(el)).strip():
+                raise BrainError("user_tab_busy",
+                                 f"{self.name}: composer already has text", self.name)
             try:
-                await self._type(el, prompt + note + "\n\n" + self._marker)
+                await self._type_and_send(el, prompt + note + "\n\n" + self._marker)
                 if files:
                     await self._attach(files)
-                await self._submit(el)
             except BrainError:
                 raise
             except Exception as e:  # noqa: BLE001
                 raise BrainError("send_failed", f"{type(e).__name__}: {e}", self.name)
 
+            for u in self.auth_urls:
+                if u in self._page.url:
+                    raise BrainError("auth_wall", f"login needed: {self._page.url}",
+                                     self.name)
+            for sel in self.auth_selectors:
+                if await self._page.locator(sel).count():
+                    raise BrainError("auth_wall", f"login needed: {self._page.url}",
+                                     self.name)
+
             try:
-                await self._wait_reply(before)
+                if self.mode == "agent":
+                    await self._wait_agent(before)
+                else:
+                    await self._wait_reply(before)
             except BrainError:
                 raise
             except Exception as e:  # noqa: BLE001
