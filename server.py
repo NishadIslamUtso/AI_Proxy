@@ -249,7 +249,7 @@ def build_prompt(name, messages, tools, limits):
         st["turns"] == 0
         or st["schema"] != schema
         or len(messages) < st["turns"]
-        or (not new_msgs and tail != st["tail"])
+        or not new_msgs
     )
 
     if full:

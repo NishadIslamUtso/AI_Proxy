@@ -118,12 +118,27 @@ class BrainBrowser:
 
     # ---------- helpers ----------
 
-    async def _first(self, selectors, timeout=2500):
+    async def _first(self, selectors, timeout=2000):
         for sel in selectors or []:
             try:
-                el = await self._page.wait_for_selector(sel, timeout=timeout)
-                if el and await el.is_enabled():
-                    return el
+                els = self._page.locator(sel)
+                n = await els.count()
+                for i in range(n):
+                    el = els.nth(i)
+                    try:
+                        if not await el.is_visible():
+                            continue
+                        el_id = (await el.get_attribute("id")) or ""
+                        el_cls = (await el.get_attribute("class")) or ""
+                        if "recaptcha" in el_id.lower():
+                            continue
+                        if "recaptcha" in el_cls.lower():
+                            continue
+                        if "hidden" in el_cls.lower():
+                            continue
+                        return el
+                    except Exception:
+                        continue
             except Exception:
                 continue
         return None
@@ -236,7 +251,12 @@ class BrainBrowser:
         if said:
             text = text[said[-1].end():]
         text = re.sub(r"^\s*(?:[…\.]{1,3}\s*)?(?:Show more\s*)?", "", text).strip()
+        # arena appends a timestamp + UI labels after the reply
+        m = re.search(r"\d{1,2}:\d{2}\s*[AP]M", text)
+        if m:
+            text = text[: m.start()].strip()
         footers = (
+            "Recovering the previous message.",
             "Is this conversation helpful so far?",
             "ChatGPT can make mistakes. Check important info.",
             "ChatGPT is AI and can make mistakes.",
@@ -283,7 +303,7 @@ class BrainBrowser:
             if el is None:
                 raise BrainError(f"NO_INPUT: no matching input on {self._page.url}")
 
-            self._marker = f"[[BR_{uuid.uuid4().hex[:8].upper()}]]"
+            self._marker = f"BR{uuid.uuid4().hex[:8].upper()}"
             note = ""
             if files:
                 note = ("\n\n[attachments uploaded: "

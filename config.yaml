@@ -61,16 +61,20 @@ brains:
 
   arena-agent:
     url: "https://arena.ai/agent"
-    notes: "Arena agent mode - built for complex tasks"
     input_selectors:
-      - "textarea"
-      - "[contenteditable='true']"
+      - ".tiptap.ProseMirror"
+      - "div.tiptap[contenteditable='true']"
+      - "main div[contenteditable='true']"
+      - "form div[contenteditable='true']"
     response_selectors:
-      - ".prose"
-      - "[class*='markdown']"
+      - "main .prose:not(.tiptap)"
+      - "[data-message-role='assistant']"
+      - "main [class*='markdown']:not(.tiptap)"
     submit_selectors:
       - "button[aria-label='Send message']"
-      - "button[type='submit']"
       - "button[aria-label*='Send']"
+      - "form button[type='submit']"
     submit_key: "Enter"
-    done_when_gone: []
+    done_when_gone:
+      - "button[aria-label*='Stop']"
+      - "[data-state='streaming']"
