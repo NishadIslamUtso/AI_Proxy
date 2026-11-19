@@ -41,6 +41,9 @@ brains:
       - "button[data-testid='send-button']"
       - "button[type='submit']"
     submit_key: "Enter"
+    strip_patterns:
+      - "^Show full message\\s*\\n+"
+      - "\\n+Show full message\\s*$"
     done_when_gone:
       - "button[data-testid='stop-button']"
   arena-chat:

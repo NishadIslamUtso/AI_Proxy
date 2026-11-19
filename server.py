@@ -392,6 +392,31 @@ async def list_tabs(brain: str):
     return {"brain": brain, "session_url": getattr(b, "session_url", ""), "tabs": out}
 
 
+@app.get("/debug/google")
+async def debug_google(brain: str):
+    if brain not in BROWSERS:
+        return JSONResponse(status_code=404, content={"error": "unknown brain"})
+    b = BROWSERS[brain]
+    try:
+        await b._connect()
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    page = await b._context.new_page()
+    try:
+        await page.goto("https://myaccount.google.com/", wait_until="domcontentloaded",
+                        timeout=20000)
+        await asyncio.sleep(3)
+        url = page.url
+        body = (await page.evaluate("document.body.innerText"))[:300]
+        logged_in = ("myaccount.google.com" in url
+                     and "sign in" not in body.lower()
+                     and "signin" not in url.lower())
+        return {"brain": brain, "url": url, "logged_in": logged_in,
+                "snippet": body[:200]}
+    finally:
+        await page.close()
+
+
 @app.get("/debug/selfcheck")
 async def selfcheck(brain: str = None):
     """Prove each brain can still complete a real turn."""
