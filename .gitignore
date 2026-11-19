@@ -11,3 +11,4 @@ last-tools-block.txt
 telemetry.jsonl
 shot*.png
 profile/
+profile.bak-*/
