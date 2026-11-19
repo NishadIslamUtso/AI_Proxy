@@ -57,6 +57,7 @@ class BrainBrowser:
         self.submit_selectors = cfg.get("submit_selectors") or []
         self.submit_key = cfg.get("submit_key", "Enter")
         self.done_when_gone = cfg.get("done_when_gone") or []
+        self.mode = cfg.get("mode", "chat")
         self.file_input_selectors = cfg.get("file_input_selectors") or ["input[type='file']"]
 
         self.cdp_url = browser_cfg["cdp_url"]
@@ -230,6 +231,17 @@ class BrainBrowser:
             await btn.click()
 
     async def _wait_reply(self, before_text):
+        if self.mode == "agent":
+            for sel in self.done_when_gone:
+                try:
+                    el = await self._page.wait_for_selector(sel, timeout=5000)
+                    if el:
+                        await self._page.wait_for_selector(sel, state="detached", timeout=900000)
+                        await asyncio.sleep(3)
+                        return
+                except Exception:
+                    continue
+            await asyncio.sleep(5)
         # Preferred: a "stop generating" control appears, then disappears.
         for sel in self.done_when_gone:
             try:
@@ -253,6 +265,17 @@ class BrainBrowser:
                 last = now
 
     async def _extract(self, before_text):
+        if self.mode == "agent":
+            for sel in self.response_selectors:
+                try:
+                    loc = self._page.locator(sel)
+                    n = await loc.count()
+                    if n:
+                        text = (await loc.nth(n - 1).inner_text()).strip()
+                        return self._clean(text)
+                except Exception:
+                    continue
+            return ""
         after = await self._body_text()
         # Preferred: everything after the marker we appended to the prompt.
         marker = getattr(self, "_marker", None)

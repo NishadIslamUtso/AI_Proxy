@@ -105,3 +105,21 @@ brains:
     submit_key: "Enter"
     done_when_gone:
       - "button[aria-label*='Stop']"
+  arena-agent:
+    url: "https://arena.ai/agent"
+    mode: agent
+    input_selectors:
+      - ".tiptap.ProseMirror"
+      - "div.tiptap[contenteditable='true']"
+      - "main div[contenteditable='true']"
+    response_selectors:
+      - "main .prose:not(.tiptap)"
+      - "main [class*='markdown']:not(.tiptap)"
+    submit_selectors:
+      - "button[aria-label*='Send']"
+      - "form button[type='submit']"
+    submit_key: "Enter"
+    done_when_gone:
+      - "button[aria-label*='Stop']"
+      - "button[aria-label*='Cancel']"
+      - "[data-state='streaming']"
