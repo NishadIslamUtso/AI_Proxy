@@ -315,16 +315,25 @@ def build_prompt(name, messages, tools, limits):
     return prompt
 
 
-async def brain_call(name, prompt, max_wait=600, files=None):
+async def brain_call(name, prompt, max_wait=None, files=None):
     """Call a brain, escalating through the configured fallback list."""
-    order = [name] + [b for b in CFG.get("escalation", []) if b != name]
+    if max_wait is None:
+        max_wait = int(CFG.get("max_wait_seconds", 180))
+    if CFG.get("escalation_enabled", False):
+        order = [name] + [b for b in CFG.get("escalation", []) if b != name]
+    else:
+        order = [name]
     last = None
     for brain in order:
         if brain not in CFG["brains"]:
             continue
         b = await get_browser(brain)
         if getattr(b, "paused", False):
-            raise BrainError("paused", f"{brain} is paused by user", brain)
+            if brain == name:
+                raise BrainError("paused", f"{brain} is paused by user", brain)
+            last = BrainError("paused_skipped", f"{brain} paused", brain)
+            print(f"[brain-proxy] skip paused escalation brain {brain}", flush=True)
+            continue
         if not b.breaker.allow():
             st = b.breaker.as_dict()
             print(f"[brain-proxy] {brain} skipped: circuit {st['state']} "
@@ -340,15 +349,14 @@ async def brain_call(name, prompt, max_wait=600, files=None):
             last = e
             record(brain, e.code, (time.time() - t0) * 1000, ok=False)
             print(f"[brain-proxy] {brain} [{e.code}]: {e}", flush=True)
-            if e.code == "paused":
-                # a user pause is a hard stop, not a reason to fail over
-                raise
         except Exception as e:  # noqa: BLE001
             code = classify(e)
             last = BrainError(code, f"{type(e).__name__}: {e}", brain)
             record(brain, code, (time.time() - t0) * 1000, ok=False)
             print(f"[brain-proxy] {brain} [{code}]: {e}", flush=True)
-    raise last or BrainError("proxy_escalation_failed", f"tried {order}")
+    if last is not None:
+        raise last
+    raise BrainError("proxy_escalation_failed", f"tried {order}")
 
 
 @app.get("/health")
@@ -671,8 +679,10 @@ async def chat_completions(request: Request):
     except Exception as e:
         print(f"[brain-proxy] dump failed: {e}", flush=True)
 
-    if _ACTIVE.locked():
-        return err(429, f"proxy busy ({MAX_CONCURRENT} tasks already running)",
+    try:
+        await asyncio.wait_for(_ACTIVE.acquire(), timeout=120)
+    except asyncio.TimeoutError:
+        return err(429, f"proxy busy ({MAX_CONCURRENT} in flight, queue full)",
                    typ="rate_limit_error", code="rate_limited")
 
     response_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -744,18 +754,20 @@ async def chat_completions(request: Request):
         return StreamingResponse(gen(), media_type="text/event-stream")
 
     try:
-        _ACTIVE_N["n"] += 1
-        async with _ACTIVE:
-            reply, served = await run_brain()
+        reply, served = await run_brain()
     except BrainError as e:
+        _ACTIVE.release()
         status = {"rate_limited": 429, "captcha": 409, "auth_wall": 409,
-                  "user_tab_busy": 409}.get(e.code, 502)
-        return JSONResponse(status_code=status, content=as_openai_error(e.code, str(e)))
+                  "user_tab_busy": 409, "paused": 409,
+                  "consent_wall": 409}.get(e.code, 502)
+        return JSONResponse(status_code=status,
+                            content=as_openai_error(e.code, str(e)))
     except Exception as e:  # noqa: BLE001
+        _ACTIVE.release()
         code = classify(e)
-        return JSONResponse(status_code=502, content=as_openai_error(code, str(e)))
-    finally:
-        _ACTIVE_N["n"] -= 1
+        return JSONResponse(status_code=502,
+                            content=as_openai_error(code, str(e)))
+    _ACTIVE.release()
 
     if body.get("tools") and not reply_looks_like_tool_json(reply):
         retry_prompt = (

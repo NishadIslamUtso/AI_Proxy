@@ -32,7 +32,7 @@ AGENT_STATUS = ("orchestrating", "thinking", "working", "planning",
 AGENT_ERROR = ("something went wrong", "please try again",
                "error occurred", "failed to generate")
 RATE_LIMIT = ("daily usage limit", "reached your daily", "usage limit reached",
-              "please try again in")
+              "usage quota", "has been exhausted", "please try again in")
 
 BRAIN_PREAMBLE = (
     "[BRAIN PROXY]\n"
@@ -867,6 +867,10 @@ class BrainBrowser:
             if reply and await self._continue_generating():
                 await self._wait_reply(before)
                 reply = await self._extract(before)
+
+            hit = await self._find_text(RATE_LIMIT)
+            if hit:
+                raise BrainError("rate_limited", f"{self.name}: {hit}", self.name)
 
             if len(reply) < 2:
                 raise BrainError("no_reply", f"{self.name} returned an empty reply",

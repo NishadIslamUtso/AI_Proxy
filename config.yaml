@@ -9,10 +9,10 @@ max_turns_per_thread: 40
 reanchor_every: 10
 
 # Try these brains in order when one fails.
-escalation:
-  - zai
-  - arena-chat
-  - chatgpt
+escalation: []
+escalation_enabled: false
+max_concurrent: 4
+max_wait_seconds: 180
 
 # The browser the proxy drives. Dedicated profile + dedicated CDP port so it
 # never fights Hermes's own browser (which is on 9222).
