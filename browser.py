@@ -4,13 +4,18 @@ Attaches to a dedicated Chromium-family browser over CDP and turns a web chat
 into something that behaves like a model endpoint. One instance per brain.
 """
 import asyncio
+import hashlib
 import os
+import random
 import re
 import time
 import uuid
 from pathlib import Path
 
 from playwright.async_api import async_playwright
+
+from breaker import Breaker
+from errors import BrainError, COOLDOWN, TRANSIENT, classify
 
 AUTH_URLS = ("/auth", "/login", "/signin", "/sign_in", "/sign-in")
 CONTINUE_HINTS = (
@@ -44,10 +49,6 @@ BRAIN_PREAMBLE_PLAIN = (
 )
 
 
-class BrainError(RuntimeError):
-    pass
-
-
 class BrainBrowser:
     def __init__(self, name, cfg, browser_cfg):
         self.name = name
@@ -67,10 +68,13 @@ class BrainBrowser:
         self._pw = None
         self._browser = None
         self._page = None
+        self.ready = False
         self._lock = asyncio.Lock()
         self.session_url = ""
         self.learned_input_selectors = []
         self.learned_response_selectors = []
+        self.sessions = {}
+        self.breaker = Breaker()
         self.turn_index = 0
         self.max_turns = 40
         self.reanchor_every = 10
@@ -199,10 +203,61 @@ class BrainBrowser:
         except Exception:
             return ""
 
-    async def _check_auth(self):
-        url = self._page.url
-        if any(u in url for u in AUTH_URLS):
-            raise BrainError(f"AUTH_REQUIRED: {self.name} is at {url}")
+    async def _preflight(self):
+        """Cheap reachability check before touching Playwright."""
+        import socket as _s
+        from urllib.parse import urlparse
+        u = urlparse(self.url)
+        host = u.hostname or "127.0.0.1"
+        port = u.port or (443 if u.scheme == "https" else 80)
+        try:
+            fam = _s.AF_INET6 if ":" in host else _s.AF_INET
+            s = _s.socket(fam, _s.SOCK_STREAM)
+            s.settimeout(2.0)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, s.connect, (host, port))
+            s.close()
+        except Exception as e:
+            raise BrainError("upstream_offline",
+                             f"{host}:{port} unreachable ({e})", self.name)
+
+    async def _guard_ui(self):
+        """Fail fast on walls the proxy must not try to solve."""
+        try:
+            title = (await self._page.title()) or ""
+        except Exception:
+            title = ""
+        low = title.lower()
+        if any(k in low for k in ("just a moment", "cloudflare", "attention required",
+                                  "verify you are human", "access denied")):
+            raise BrainError("captcha", f"{self.name} hit a challenge page: {title}",
+                             self.name)
+        try:
+            if any(u in self._page.url for u in AUTH_URLS):
+                raise BrainError("auth_wall", f"{self.name} is at {self._page.url}",
+                                 self.name)
+        except BrainError:
+            raise
+        except Exception:
+            pass
+        # arena's post-task feedback dialog steals the composer
+        try:
+            if await self._page.locator("text=Was this task successful?").count():
+                await self._page.keyboard.press("Escape")
+                await asyncio.sleep(0.6)
+        except Exception:
+            pass
+
+    async def _continue_generating(self):
+        for txt in ("Continue generating", "Keep generating", "Show more"):
+            try:
+                loc = self._page.locator(f"text={txt}")
+                if await loc.count():
+                    await loc.first.click(timeout=2000)
+                    return True
+            except Exception:
+                continue
+        return False
 
     async def new_thread(self):
         """Start a fresh web chat. Best-effort: navigates back to the base URL."""
@@ -244,16 +299,32 @@ class BrainBrowser:
 
     async def _wait_reply(self, before_text):
         if self.mode == "agent":
+            deadline = time.time() + 900
             for sel in self.done_when_gone:
                 try:
                     el = await self._page.wait_for_selector(sel, timeout=5000)
                     if el:
-                        await self._page.wait_for_selector(sel, state="detached", timeout=900000)
+                        await self._page.wait_for_selector(
+                            sel, state="detached",
+                            timeout=max(1.0, deadline - time.time()))
                         await asyncio.sleep(3)
                         return
                 except Exception:
                     continue
-            await asyncio.sleep(5)
+            # no stop control matched: fall back to "text stopped changing"
+            last = before_text
+            stable = 0
+            while time.time() < deadline:
+                await asyncio.sleep(2)
+                now = await self._body_text()
+                if now != before_text and now == last:
+                    stable += 1
+                    if stable >= 3:
+                        return
+                else:
+                    stable = 0
+                    last = now
+            return
         # Preferred: a "stop generating" control appears, then disappears.
         for sel in self.done_when_gone:
             try:
@@ -428,58 +499,135 @@ class BrainBrowser:
                 continue
         return False
 
+    def _task_key(self, prompt):
+        return hashlib.sha256(prompt[:400].encode("utf-8", "ignore")).hexdigest()[:16]
+
     async def ask(self, prompt, files=None):
         """Send one prompt to the web chat and return its reply."""
-        for _attempt in range(2):
+        last = None
+        for attempt in range(2):
             try:
-                return await self._ask_once(prompt, files)
-            except Exception as e:
-                if _attempt == 0:
-                    print(f"[brain-proxy] {self.name} ask failed, retrying on fresh tab: {e}", flush=True)
+                reply = await self._ask_once(prompt, files)
+                self.breaker.ok()
+                return reply
+            except BrainError as e:
+                last = e
+                self.breaker.fail(e.code, COOLDOWN.get(e.code))
+                if e.code in TRANSIENT and attempt == 0:
+                    print(f"[brain-proxy] {self.name} [{e.code}] retrying: {e}", flush=True)
                     self.session_url = ""
                     self.ready = False
                     self._page = None
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(1.0 + random.random())
                     continue
                 raise
+            except Exception as e:  # noqa: BLE001
+                last = e
+                code = classify(e)
+                self.breaker.fail(code, COOLDOWN.get(code))
+                if code in TRANSIENT and attempt == 0:
+                    print(f"[brain-proxy] {self.name} [{code}] retrying: {e}", flush=True)
+                    self.session_url = ""
+                    self.ready = False
+                    self._page = None
+                    await asyncio.sleep(1.0 + random.random())
+                    continue
+                raise BrainError(code, f"{type(e).__name__}: {e}", self.name)
+        raise BrainError(classify(last) if last else "no_reply", str(last), self.name)
 
     async def _ask_once(self, prompt, files=None):
         async with self._lock:
-            await self._connect()
-            await self._check_auth()
+            try:
+                await self._preflight()
+                await self._connect()
+            except BrainError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                raise BrainError(classify(e), f"{type(e).__name__}: {e}", self.name)
+
+            await self._guard_ui()
             before = await self._body_text()
 
+            # per-task thread: same task keeps its conversation, a new task
+            # gets its own instead of inheriting someone else's.
+            key = self._task_key(prompt)
+            if not self.session_url:
+                self.session_url = self.sessions.get(key, "")
+                if self.session_url:
+                    try:
+                        await self._connect()
+                        await self._guard_ui()
+                        before = await self._body_text()
+                    except BrainError:
+                        raise
+                    except Exception as e:  # noqa: BLE001
+                        raise BrainError(classify(e), str(e), self.name)
+
             el = await self._first(self.input_selectors, timeout=30000)
+            if el is None and await self._heal():
+                el = await self._first(self.input_selectors, timeout=5000)
             if el is None:
-                raise BrainError(f"NO_INPUT: no matching input on {self._page.url}")
+                raise BrainError("no_reply", f"no composer on {self._page.url}", self.name)
+
+            try:
+                cur = (await el.evaluate(
+                    "e => (e.innerText || e.value || e.textContent || '').trim()")) or ""
+            except Exception:
+                cur = ""
+            if cur.strip():
+                raise BrainError("user_tab_busy",
+                                 f"{self.name}: composer already has text", self.name)
 
             self._marker = f"BR{uuid.uuid4().hex[:8].upper()}"
             note = ""
             if files:
                 note = ("\n\n[attachments uploaded: "
                         + ", ".join(os.path.basename(f) for f in files) + "]")
-            await self._type(el, prompt + note + "\n\n" + self._marker)
-            if files:
-                await self._attach(files)
-            await self._submit(el)
-            await self._wait_reply(before)
-            reply = await self._extract(before)
+            try:
+                await self._type(el, prompt + note + "\n\n" + self._marker)
+                if files:
+                    await self._attach(files)
+                await self._submit(el)
+            except BrainError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                raise BrainError("send_failed", f"{type(e).__name__}: {e}", self.name)
 
+            try:
+                await self._wait_reply(before)
+            except BrainError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                raise BrainError(classify(e), f"{type(e).__name__}: {e}", self.name)
+
+            reply = await self._extract(before)
             self.session_url = self._page.url
+            self.sessions[key] = self.session_url
             self._save_learned()
 
             if not reply or len(reply.strip()) < 2:
-                healed = await self._heal()
-                if healed:
-                    await self._submit(el)
-                    await self._wait_reply(before)
-                    reply = await self._extract(before)
-                    self.session_url = self._page.url
-                    self._save_learned()
+                if await self._heal():
+                    try:
+                        await self._submit(el)
+                        await self._wait_reply(before)
+                        reply = await self._extract(before)
+                        self.session_url = self._page.url
+                        self.sessions[key] = self.session_url
+                        self._save_learned()
+                    except Exception:  # noqa: BLE001
+                        pass
 
-            if len(reply) < 2:
+            if not reply or len(reply.strip()) < 2:
                 await asyncio.sleep(3)
                 reply = await self._extract(before)
+
+            if reply and await self._continue_generating():
+                await self._wait_reply(before)
+                reply = await self._extract(before)
+
+            if len(reply) < 2:
+                raise BrainError("no_reply", f"{self.name} returned an empty reply",
+                                 self.name)
 
             self.turn_index += 1
             return reply

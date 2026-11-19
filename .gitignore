@@ -8,3 +8,5 @@ attachments/
 last-request.json
 last-tools-block.txt
 *.lnk
+telemetry.jsonl
+shot*.png

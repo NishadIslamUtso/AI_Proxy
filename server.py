@@ -20,7 +20,15 @@ import yaml
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from browser import BRAIN_PREAMBLE, BRAIN_PREAMBLE_PLAIN, BrainBrowser, BrainError
+from browser import BRAIN_PREAMBLE, BRAIN_PREAMBLE_PLAIN, BrainBrowser
+from errors import (
+    COOLDOWN,
+    FAIL_FAST,
+    TRANSIENT,
+    BrainError,
+    as_openai_error,
+    classify,
+)
 
 ROOT = Path(__file__).resolve().parent
 CFG = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
@@ -29,6 +37,28 @@ app = FastAPI(title="brain-proxy")
 BROWSERS = {}
 STATE = {}
 _FACTORY_LOCK = asyncio.Lock()
+
+TELEMETRY = ROOT / "telemetry.jsonl"
+STATS = {}
+MAX_CONCURRENT = int(CFG.get("max_concurrent", 2))
+_ACTIVE = asyncio.Semaphore(MAX_CONCURRENT)
+_ACTIVE_N = {"n": 0}
+
+
+def record(brain, code, ms, attempt=0, ok=False):
+    try:
+        with TELEMETRY.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"t": round(time.time(), 3), "brain": brain,
+                                "code": code, "ms": int(ms), "attempt": attempt,
+                                "ok": ok}) + "\n")
+    except Exception:
+        pass
+    s = STATS.setdefault(brain, {"ok": 0, "fail": 0, "codes": {}})
+    if ok:
+        s["ok"] += 1
+    else:
+        s["fail"] += 1
+        s["codes"][code] = s["codes"].get(code, 0) + 1
 
 ROLE_MARKERS = (
     "[SYSTEM]", "[USER]", "[ASSISTANT]", "[TOOL RESULT]",
@@ -274,23 +304,47 @@ def build_prompt(name, messages, tools, limits):
     return prompt
 
 
-async def brain_call(name, prompt, max_wait=300, files=None):
+async def brain_call(name, prompt, max_wait=600, files=None):
     """Call a brain, escalating through the configured fallback list."""
     order = [name] + [b for b in CFG.get("escalation", []) if b != name]
     last = None
     for brain in order:
+        if brain not in CFG["brains"]:
+            continue
+        b = await get_browser(brain)
+        if not b.breaker.allow():
+            st = b.breaker.as_dict()
+            print(f"[brain-proxy] {brain} skipped: circuit {st['state']} "
+                  f"({st['last_code']})", flush=True)
+            last = BrainError("circuit_open", f"{brain} is benched", brain)
+            continue
+        t0 = time.time()
         try:
-            b = await get_browser(brain)
-            return await asyncio.wait_for(b.ask(prompt, files=files), timeout=max_wait), brain
-        except Exception as e:  # noqa: BLE001
+            reply = await asyncio.wait_for(b.ask(prompt, files=files), timeout=max_wait)
+            record(brain, "ok", (time.time() - t0) * 1000, ok=True)
+            return reply, brain
+        except BrainError as e:
             last = e
-            print(f"[brain-proxy] {brain} failed: {type(e).__name__}: {e}", flush=True)
-    raise BrainError(f"proxy_escalation_failed: tried {order} ({last})")
+            record(brain, e.code, (time.time() - t0) * 1000, ok=False)
+            print(f"[brain-proxy] {brain} [{e.code}]: {e}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            code = classify(e)
+            last = BrainError(code, f"{type(e).__name__}: {e}", brain)
+            record(brain, code, (time.time() - t0) * 1000, ok=False)
+            print(f"[brain-proxy] {brain} [{code}]: {e}", flush=True)
+    raise last or BrainError("proxy_escalation_failed", f"tried {order}")
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "brains": list(BROWSERS.keys()), "config": list(CFG["brains"])}
+    return {
+        "ok": True,
+        "brains": list(BROWSERS.keys()),
+        "config": list(CFG["brains"]),
+        "circuits": {n: b.breaker.as_dict() for n, b in BROWSERS.items()},
+        "active": _ACTIVE_N["n"],
+        "max_concurrent": MAX_CONCURRENT,
+    }
 
 
 @app.post("/debug/reset-session")
@@ -336,6 +390,46 @@ async def list_tabs(brain: str):
             alive = False
         out.append({"url": p.url, "alive": alive, "current": p is b._page})
     return {"brain": brain, "session_url": getattr(b, "session_url", ""), "tabs": out}
+
+
+@app.get("/debug/selfcheck")
+async def selfcheck(brain: str = None):
+    """Prove each brain can still complete a real turn."""
+    names = [brain] if brain else list(CFG["brains"].keys())
+    out = {}
+    for n in names:
+        try:
+            b = await get_browser(n)
+        except Exception as e:  # noqa: BLE001
+            out[n] = {"ok": False, "code": "unknown", "error": str(e)[:200]}
+            continue
+        t0 = time.time()
+        try:
+            reply = await asyncio.wait_for(
+                b.ask("Reply with exactly: SELFCHECK OK"), timeout=120)
+            ok = bool(reply and "SELFCHECK" in reply.upper())
+            out[n] = {"ok": ok, "ms": int((time.time() - t0) * 1000),
+                      "reply": (reply or "")[:120]}
+            record(n, "ok" if ok else "site_changed",
+                   (time.time() - t0) * 1000, ok=ok)
+            if not ok:
+                b.breaker.fail("site_changed", COOLDOWN.get("site_changed"))
+        except Exception as e:  # noqa: BLE001
+            code = classify(e)
+            out[n] = {"ok": False, "code": code, "error": str(e)[:200]}
+            b.breaker.fail(code, COOLDOWN.get(code))
+            record(n, code, (time.time() - t0) * 1000, ok=False)
+    return out
+
+
+@app.get("/debug/stats")
+async def stats():
+    return {
+        "stats": STATS,
+        "circuits": {n: b.breaker.as_dict() for n, b in BROWSERS.items()},
+        "active": _ACTIVE_N["n"],
+        "max_concurrent": MAX_CONCURRENT,
+    }
 
 
 @app.post("/debug/switch")
@@ -441,6 +535,10 @@ async def chat_completions(request: Request):
     except Exception as e:
         print(f"[brain-proxy] dump failed: {e}", flush=True)
 
+    if _ACTIVE.locked():
+        return err(429, f"proxy busy ({MAX_CONCURRENT} tasks already running)",
+                   typ="rate_limit_error", code="rate_limited")
+
     response_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
@@ -510,9 +608,18 @@ async def chat_completions(request: Request):
         return StreamingResponse(gen(), media_type="text/event-stream")
 
     try:
-        reply, served = await run_brain()
+        _ACTIVE_N["n"] += 1
+        async with _ACTIVE:
+            reply, served = await run_brain()
+    except BrainError as e:
+        status = {"rate_limited": 429, "captcha": 409, "auth_wall": 409,
+                  "user_tab_busy": 409}.get(e.code, 502)
+        return JSONResponse(status_code=status, content=as_openai_error(e.code, str(e)))
     except Exception as e:  # noqa: BLE001
-        return err(502, str(e), typ="proxy_error")
+        code = classify(e)
+        return JSONResponse(status_code=502, content=as_openai_error(code, str(e)))
+    finally:
+        _ACTIVE_N["n"] -= 1
 
     parsed = parse_tool_reply(sanitize(reply))
     usage = {
