@@ -50,14 +50,18 @@ brains:
       - "div.tiptap[contenteditable='true']"
       - "main div[contenteditable='true']"
     response_selectors:
+      - "main .prose:not(.tiptap) > div > div > div"
+      - "main [data-message-role='assistant'] .prose"
       - "main .prose:not(.tiptap)"
-      - "[data-message-role='assistant']"
-      - "main [class*='markdown']:not(.tiptap)"
     submit_selectors:
       - "button[aria-label='Send message']"
       - "button[aria-label*='Send']"
       - "form button[type='submit']"
     submit_key: "Enter"
+    strip_patterns:
+      - "^Thought for \\d+\\s*(?:second|minute)s?\\s*\\n+"
+      - "^Thinking\\.{0,3}\\s*\\n+"
+      - "\\n+\\d+s\\s*\\|\\s*(?:just now|\\d+m ago)\\s*$"
     done_when_gone:
       - "button[aria-label*='Stop']"
   arena-code:
@@ -133,14 +137,19 @@ brains:
       - "div[contenteditable][role='textbox']"
       - "textarea"
     response_selectors:
+      - "div.ds-markdown:last-of-type"
       - ".ds-markdown"
       - "[class*='markdown']"
-      - "div[class*='message']"
     submit_selectors:
       - "button[aria-label*='Send']"
       - "button[type='submit']"
       - "div[role='button'][aria-label*='Send']"
     submit_key: "Enter"
+    strip_patterns:
+      - "^Thought for \\d+\\s*(?:second|minute)s?\\s*\\n+"
+      - "^Thinking\\.{0,3}\\s*\\n+"
+      - "\\n+(?:DeepThink|Search|R1)\\s*$"
+      - "\\n+AI-generated, for reference only\\s*$"
     done_when_gone: []
     auth_urls:
       - "/sign_in"

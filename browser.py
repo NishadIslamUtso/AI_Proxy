@@ -67,6 +67,7 @@ class BrainBrowser:
         self.agent_deadline = cfg.get("agent_deadline", 900)
         self.auth_urls = cfg.get("auth_urls", [])
         self.auth_selectors = cfg.get("auth_selectors", [])
+        self.strip_patterns = cfg.get("strip_patterns") or []
         self.file_input_selectors = cfg.get("file_input_selectors") or ["input[type='file']"]
 
         self.cdp_url = browser_cfg["cdp_url"]
@@ -524,6 +525,16 @@ class BrainBrowser:
             "Latest response",
             "Response complete",
         )
+        for pat in self.strip_patterns:
+            text = re.sub(pat, "", text, flags=re.I | re.M).strip()
+
+        paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+        if len(paras) >= 2:
+            opener = paras[0].lower()
+            if re.match(r"^(we need|the user (wants|asked|is)|i should|i need|okay,? |alright,? |let me)", opener):
+                paras = paras[1:]
+            text = "\n\n".join(paras)
+
         cut = len(text)
         for f in footers:
             i = text.find(f)
