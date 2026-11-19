@@ -275,8 +275,10 @@ class BrainBrowser:
                 await asyncio.sleep(0.6)
         except Exception:
             pass
-        # cookie / consent wall: never auto-accept, surface it instead
+        # cookie / consent wall: click the plainly-safe buttons once, then
+        # surface it if it is still there
         try:
+            await self._dismiss_safe_dialogs()
             for sel in ("text=I accept", "text=Accept all", "text=Accept cookies",
                         "text=Agree", "button:has-text(\"Accept\")"):
                 if await self._page.locator(sel).count():
@@ -352,6 +354,23 @@ class BrainBrowser:
                 return el
         return None
 
+    async def _dismiss_safe_dialogs(self):
+        safe = (
+            "button:has-text('Accept all')",
+            "button:has-text('Accept')",
+            "button:has-text('Got it')",
+            "button:has-text('I agree')",
+            "button:has-text('OK')",
+        )
+        for sel in safe:
+            try:
+                loc = self._page.locator(sel)
+                if await loc.count() and await loc.first.is_visible():
+                    await loc.first.click(timeout=2000)
+                    await asyncio.sleep(0.5)
+            except Exception:
+                continue
+
     async def _composer_text(self, el):
         tag = (await el.evaluate("e => e.tagName")).lower()
         if tag in ("textarea", "input"):
@@ -359,6 +378,7 @@ class BrainBrowser:
         return (await el.inner_text()) or ""
 
     async def _type_and_send(self, el, prompt):
+        await self._dismiss_safe_dialogs()
         await el.click()
         await self._page.keyboard.press("Control+A")
         await self._page.keyboard.press("Delete")
