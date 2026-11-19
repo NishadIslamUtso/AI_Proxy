@@ -67,9 +67,29 @@ class BrainBrowser:
         self._browser = None
         self._page = None
         self._lock = asyncio.Lock()
+        self.session_url = ""
+        self.learned_input_selectors = []
+        self.learned_response_selectors = []
         self.turn_index = 0
         self.max_turns = 40
         self.reanchor_every = 10
+
+        try:
+            import json as _j, pathlib as _p
+            f = _p.Path("C:/hermes/brain-proxy/learned.json")
+            if f.exists():
+                data = _j.loads(f.read_text(encoding="utf-8")).get(self.name, {})
+                self.session_url = data.get("session_url", "")
+                for s in data.get("input", [])[::-1]:
+                    if s not in self.input_selectors:
+                        self.input_selectors.insert(0, s)
+                for s in data.get("response", [])[::-1]:
+                    if s not in self.response_selectors:
+                        self.response_selectors.insert(0, s)
+                self.learned_input_selectors = list(data.get("input", []))
+                self.learned_response_selectors = list(data.get("response", []))
+        except Exception:
+            pass
 
     # ---------- lifecycle ----------
 
@@ -84,11 +104,23 @@ class BrainBrowser:
             "Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});"
             "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});"
         )
-        page = None
+        candidates = [self.session_url] if self.session_url else []
         base = self.url.split("?")[0].rstrip("/")
         for p in ctx.pages:
+            if p.url.rstrip("/") == base.rstrip("/"):
+                candidates.append(p.url)
+                break
+        for p in ctx.pages:
             if p.url.startswith(base):
-                page = p
+                candidates.append(p.url)
+                break
+        page = None
+        for u in candidates:
+            for p in ctx.pages:
+                if p.url == u:
+                    page = p
+                    break
+            if page:
                 break
         if page is None:
             page = await ctx.new_page()
@@ -98,8 +130,13 @@ class BrainBrowser:
             except Exception:
                 pass
         self._page = page
-        print(f"[brain-proxy] {self.name} using {page.url}", flush=True)
         await page.bring_to_front()
+        if not page.url.startswith("http"):
+            await page.goto(self.url, wait_until="domcontentloaded")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
 
     async def close(self):
         try:
@@ -277,6 +314,70 @@ class BrainBrowser:
     def _trim_footer(self, text):
         return self._clean(text)
 
+    async def _heal(self):
+        try:
+            data = await self._page.evaluate("""
+                () => {
+                  const vis = e => {
+                    const r = e.getBoundingClientRect();
+                    return r.width > 20 && r.height > 10;
+                  };
+                  const inputs = [...document.querySelectorAll(
+                    'textarea, [contenteditable="true"], .ProseMirror, .tiptap'
+                  )].filter(e => vis(e) && !(e.id||'').toLowerCase().includes('recaptcha'));
+                  const bubbles = [...document.querySelectorAll(
+                    'article, [data-message-role], [class*="message"], [class*="markdown"], .prose'
+                  )].filter(e => vis(e) && !e.classList.contains('tiptap'));
+                  return {
+                    inputs: inputs.map(e => ({
+                      tag: e.tagName,
+                      cls: e.className,
+                      id: e.id
+                    })),
+                    bubbles: bubbles.slice(-5).map(e => ({
+                      tag: e.tagName,
+                      cls: (typeof e.className === 'string') ? e.className : ''
+                    }))
+                  };
+                }
+            """)
+        except Exception:
+            return False
+        added = False
+        for i in data.get("inputs", []):
+            cls = i.get("cls") or ""
+            if "ProseMirror" in cls or "tiptap" in cls:
+                sel = "." + ".".join(c for c in cls.split() if c and not c.startswith("["))[:200]
+                if sel and sel not in self.input_selectors and sel not in self.learned_input_selectors:
+                    self.learned_input_selectors.append(sel)
+                    self.input_selectors.insert(0, sel)
+                    added = True
+        for b in data.get("bubbles", []):
+            cls = b.get("cls") or ""
+            if "markdown" in cls or "prose" in cls:
+                sel = "." + ".".join(c for c in cls.split() if c and not c.startswith("["))[:200]
+                if sel and sel not in self.response_selectors and sel not in self.learned_response_selectors:
+                    self.learned_response_selectors.append(sel)
+                    self.response_selectors.insert(0, sel)
+                    added = True
+        return added
+
+    def _save_learned(self):
+        try:
+            import json as _j, pathlib as _p
+            out = _p.Path("C:/hermes/brain-proxy/learned.json")
+            data = {}
+            if out.exists():
+                data = _j.loads(out.read_text(encoding="utf-8"))
+            data[self.name] = {
+                "session_url": self.session_url,
+                "input": self.learned_input_selectors,
+                "response": self.learned_response_selectors,
+            }
+            out.write_text(_j.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
     # ---------- public ----------
 
     async def _attach(self, files):
@@ -314,6 +415,18 @@ class BrainBrowser:
             await self._submit(el)
             await self._wait_reply(before)
             reply = await self._extract(before)
+
+            self.session_url = self._page.url
+            self._save_learned()
+
+            if not reply or len(reply.strip()) < 2:
+                healed = await self._heal()
+                if healed:
+                    await self._submit(el)
+                    await self._wait_reply(before)
+                    reply = await self._extract(before)
+                    self.session_url = self._page.url
+                    self._save_learned()
 
             if len(reply) < 2:
                 await asyncio.sleep(3)

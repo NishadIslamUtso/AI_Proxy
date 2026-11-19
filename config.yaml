@@ -11,7 +11,7 @@ reanchor_every: 10
 # Try these brains in order when one fails.
 escalation:
   - chatgpt
-  - arena-agent
+  - arena-chat
 
 # The browser the proxy drives. Dedicated profile + dedicated CDP port so it
 # never fights Hermes's own browser (which is on 9222).
@@ -30,42 +30,25 @@ tool_truncation:
 
 brains:
   chatgpt:
-    url: https://chatgpt.com/
+    url: "https://chatgpt.com/"
     input_selectors:
       - ".ProseMirror"
       - "div#prompt-textarea"
       - "div[contenteditable='true']"
-      - "textarea"
     response_selectors:
       - "div[data-message-author-role='assistant']"
     submit_selectors:
       - "button[data-testid='send-button']"
-      - "button[aria-label*='Send']"
+      - "button[type='submit']"
     submit_key: "Enter"
     done_when_gone:
       - "button[data-testid='stop-button']"
-      - "button[aria-label*='Stop']"
-
-  arena-sonnet:
-    url: "https://arena.ai/code/direct?model_a=claude-sonnet-5-5-high"
-    input_selectors:
-      - "textarea"
-    response_selectors:
-      - ".prose"
-      - "[class*='markdown']"
-    submit_selectors:
-      - "button[aria-label='Send message']"
-      - "button[type='submit']"
-    submit_key: "Enter"
-    done_when_gone: []
-
-  arena-agent:
-    url: "https://arena.ai/agent"
+  arena-chat:
+    url: "https://arena.ai/"
     input_selectors:
       - ".tiptap.ProseMirror"
       - "div.tiptap[contenteditable='true']"
       - "main div[contenteditable='true']"
-      - "form div[contenteditable='true']"
     response_selectors:
       - "main .prose:not(.tiptap)"
       - "[data-message-role='assistant']"
@@ -77,4 +60,48 @@ brains:
     submit_key: "Enter"
     done_when_gone:
       - "button[aria-label*='Stop']"
-      - "[data-state='streaming']"
+  arena-code:
+    url: "https://arena.ai/code"
+    input_selectors:
+      - ".tiptap.ProseMirror"
+      - "div.tiptap[contenteditable='true']"
+      - "main div[contenteditable='true']"
+    response_selectors:
+      - "main .prose:not(.tiptap)"
+      - "main [class*='markdown']:not(.tiptap)"
+    submit_selectors:
+      - "button[aria-label*='Send']"
+      - "form button[type='submit']"
+    submit_key: "Enter"
+    done_when_gone:
+      - "button[aria-label*='Stop']"
+  arena-sonnet:
+    url: "https://arena.ai/code/direct?model_a=claude-sonnet-5-5-high"
+    input_selectors:
+      - ".tiptap.ProseMirror"
+      - "div.tiptap[contenteditable='true']"
+      - "main div[contenteditable='true']"
+    response_selectors:
+      - "main .prose:not(.tiptap)"
+      - "main [class*='markdown']:not(.tiptap)"
+    submit_selectors:
+      - "button[aria-label*='Send']"
+      - "form button[type='submit']"
+    submit_key: "Enter"
+    done_when_gone:
+      - "button[aria-label*='Stop']"
+  arena-gpt5:
+    url: "https://arena.ai/code/direct?model_a=gpt-5-high"
+    input_selectors:
+      - ".tiptap.ProseMirror"
+      - "div.tiptap[contenteditable='true']"
+      - "main div[contenteditable='true']"
+    response_selectors:
+      - "main .prose:not(.tiptap)"
+      - "main [class*='markdown']:not(.tiptap)"
+    submit_selectors:
+      - "button[aria-label*='Send']"
+      - "form button[type='submit']"
+    submit_key: "Enter"
+    done_when_gone:
+      - "button[aria-label*='Stop']"

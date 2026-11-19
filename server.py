@@ -293,6 +293,50 @@ async def health():
     return {"ok": True, "brains": list(BROWSERS.keys()), "config": list(CFG["brains"])}
 
 
+@app.post("/debug/reset-session")
+async def reset_session(request: Request):
+    body = await request.json()
+    name = body.get("brain")
+    if not name:
+        return JSONResponse(status_code=400, content={"error": "brain required"})
+    if name not in BROWSERS:
+        return JSONResponse(status_code=404, content={"error": "unknown brain"})
+    b = BROWSERS[name]
+    b.session_url = ""
+    b._save_learned()
+    return {"ok": True, "brain": name, "session_url": ""}
+
+
+@app.get("/debug/sessions")
+async def list_sessions():
+    out = {}
+    for name, b in BROWSERS.items():
+        out[name] = {
+            "session_url": getattr(b, "session_url", ""),
+            "learned_input": getattr(b, "learned_input_selectors", []),
+            "learned_response": getattr(b, "learned_response_selectors", []),
+        }
+    return out
+
+
+@app.post("/debug/switch")
+async def switch_default(request: Request):
+    body = await request.json()
+    name = body.get("brain")
+    if name not in CFG["brains"]:
+        return JSONResponse(status_code=404, content={"error": "unknown brain"})
+    CFG["default"] = name
+    try:
+        import yaml as _y, pathlib as _p
+        f = _p.Path(__file__).resolve().parent / "config.yaml"
+        data = _y.safe_load(f.read_text(encoding="utf-8"))
+        data["default"] = name
+        f.write_text(_y.safe_dump(data, sort_keys=False), encoding="utf-8")
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"write failed: {e}"})
+    return {"ok": True, "default": name}
+
+
 @app.get("/v1/models")
 async def list_models():
     return {
