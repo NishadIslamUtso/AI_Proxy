@@ -3,6 +3,50 @@ host: 127.0.0.1
 port: 8000
 default: chatgpt
 
+helper:
+  enabled: true
+  mode: hermes_cli
+  cli_argv:
+    - "C:/Users/Nishad Islam Utso/AppData/Local/hermes/hermes-agent/.hermes/bin/hermes.exe"
+    - "chat"
+    - "--model"
+    - "qwen/qwen4-max:free"
+    - "-Q"
+    - "-q"
+    - "{prompt}"
+  cli_env:
+    HERMES_PROXY_GUARD: "1"
+    HERMES_MODEL_PROVIDER: "nous"
+    HERMES_MODEL_DEFAULT: "qwen/qwen4-max:free"
+  cli_timeout_seconds: 300
+  role_prompt: |
+    You are a helper subprocess inside an agent framework.
+    Rules, enforced:
+    - Do not converse. Do not greet. Do not explain.
+    - Do not give opinions, preferences, recommendations, or commentary.
+    - Do not write apologies, preambles, or "here is...".
+    - Reply with exactly the JSON or text the caller asked for.
+    - If you cannot produce it, reply with {"error":"cannot"}.
+  tool_format_prompt: |
+    You are a tool-call formatter. Given a user request and a tools list,
+    return EXACTLY one JSON object on its own:
+      {"tool": "<name>", "args": { ... }}
+    or, if no tool applies:
+      {"final": "<plain answer>"}
+    No prose. No code fences. No commentary. Just the JSON.
+  trigger_on:
+    - tool_json_missing
+    - rate_limited
+    - captcha
+    - auth_wall
+    - site_changed
+    - consent_wall
+    - paused
+    - proxy_escalation_failed
+    - hard_timeout
+
+hard_timeout_seconds: 300
+
 # Turn budget per web chat thread. At the limit the proxy asks the brain for a
 # summary, opens a fresh chat, and seeds it with that summary.
 max_turns_per_thread: 40

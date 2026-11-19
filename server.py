@@ -60,6 +60,87 @@ def record(brain, code, ms, attempt=0, ok=False):
         s["fail"] += 1
         s["codes"][code] = s["codes"].get(code, 0) + 1
 
+import os as _os
+import json as _json_helper
+import subprocess as _subprocess
+import tempfile as _tempfile
+
+HELPER_RECURSION_GUARD = "HERMES_PROXY_GUARD"
+
+
+async def call_helper(messages, tools=None, kind="chat"):
+    h = CFG.get("helper") or {}
+    if not h.get("enabled"):
+        return None
+    if _os.environ.get(HELPER_RECURSION_GUARD):
+        print("[helper] recursion guard active, refusing to call", flush=True)
+        return None
+
+    system_text = h.get("role_prompt", "")
+    if kind == "tool_json" and tools:
+        system_text = h.get("tool_format_prompt", "") or system_text
+
+    flat = [{"role": "system", "content": system_text}]
+    for m in messages:
+        c = content_to_text(m.get("content", ""))
+        if c:
+            flat.append({"role": m.get("role", "user"), "content": c})
+    if kind == "tool_json" and tools:
+        tool_list = "\n".join(
+            f"- {t['function']['name']}: {t['function'].get('description','')}"
+            for t in tools if t.get("type") == "function"
+        )
+        flat.append({"role": "user", "content":
+                     "Available tools:\n" + tool_list +
+                     "\n\nReturn exactly one JSON object."})
+
+    prompt = "\n\n".join(f"[{m['role'].upper()}]\n{m['content']}" for m in flat)
+
+    argv = [str(a).replace("{prompt}", prompt) for a in (h.get("cli_argv") or [])]
+    if not argv:
+        print("[helper] no cli_argv configured", flush=True)
+        return None
+
+    env = _os.environ.copy()
+    env.update(h.get("cli_env") or {})
+
+    timeout = float(h.get("cli_timeout_seconds", 90))
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _subprocess.run(
+                argv, capture_output=True, text=True,
+                timeout=timeout, env=env,
+            ),
+        )
+    except _subprocess.TimeoutExpired:
+        print("[helper] timeout", flush=True)
+        return None
+    except FileNotFoundError:
+        print("[helper] hermes binary not found on PATH", flush=True)
+        return None
+    except Exception as e:
+        print(f"[helper] spawn failed: {type(e).__name__}: {e}", flush=True)
+        return None
+
+    if result.returncode != 0:
+        print(f"[helper] exit {result.returncode}: "
+              f"{(result.stderr or '').strip()[:200]}", flush=True)
+        return None
+
+    out = (result.stdout or "").strip()
+    if not out:
+        print("[helper] empty stdout", flush=True)
+        return None
+
+    if "<html" in out.lower() or "brain-proxy" in out.lower():
+        print("[helper] output looks like proxy echo, refusing", flush=True)
+        return None
+
+    print(f"[helper] ok kind={kind} len={len(out)}", flush=True)
+    return out
+
+
 def reply_looks_like_tool_json(reply):
     s = (reply or "").strip()
     if not s.startswith("{"):
@@ -536,6 +617,41 @@ async def debug_state(brain: str):
     }
 
 
+@app.get("/debug/helper-test")
+async def helper_test():
+    h = CFG.get("helper") or {}
+    if not h.get("enabled"):
+        return {"enabled": False, "reason": "helper.enabled is false"}
+    reply = await call_helper(
+        [{"role": "user", "content": "Reply with exactly: HELPER OK"}],
+        kind="chat",
+    )
+    return {"enabled": True, "mode": h.get("mode"),
+            "cli_argv": h.get("cli_argv"), "reply": reply}
+
+
+@app.get("/debug/helper-tool-test")
+async def helper_tool_test():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }]
+    reply = await call_helper(
+        [{"role": "user", "content":
+          "What is the weather in Tokyo? Use the get_weather tool."}],
+        tools=tools, kind="tool_json",
+    )
+    return {"reply": reply}
+
+
 @app.get("/debug/selfcheck")
 async def selfcheck(brain: str = None):
     """Prove each brain can still complete a real turn."""
@@ -770,18 +886,15 @@ async def chat_completions(request: Request):
     _ACTIVE.release()
 
     if body.get("tools") and not reply_looks_like_tool_json(reply):
-        retry_prompt = (
-            "Your previous reply was prose. You must reply with "
-            "exactly one JSON object on its own: "
-            '{"tool": "<name>", "args": {...}} or {"final": "..."}. '
-            "Do not add any other text before or after. Retry for: "
-            + content_to_text(messages[-1].get("content", ""))
+        print("[brain-proxy] tool JSON missing, delegating to helper",
+              flush=True)
+        _h = await call_helper(
+            messages,
+            tools=body.get("tools"),
+            kind="tool_json",
         )
-        try:
-            _r = await brain_call(served or model_name, retry_prompt)
-            reply = _r[0] if isinstance(_r, tuple) else _r
-        except Exception:
-            pass
+        if _h is not None:
+            reply = _h
 
     parsed = parse_tool_reply(sanitize(reply))
     usage = {
