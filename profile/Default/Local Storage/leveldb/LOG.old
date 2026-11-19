@@ -1,0 +1,6 @@
+2026/11/19-15:58:32.352 24b8 Reusing MANIFEST C:\hermes\brain-proxy\profile\Default\Local Storage\leveldb/MANIFEST-000001
+2026/11/19-15:58:32.353 24b8 Recovering log #9
+2026/11/19-15:58:32.355 24b8 Reusing old log C:\hermes\brain-proxy\profile\Default\Local Storage\leveldb/000009.log 
+2026/11/19-15:58:45.931 6318 Level-0 table #13: started
+2026/11/19-15:58:45.936 6318 Level-0 table #13: 20538 bytes OK
+2026/11/19-15:58:45.937 6318 Delete type=0 #9

@@ -1,0 +1,14 @@
+2026/11/19-15:58:40.760 61e8 Reusing MANIFEST C:\hermes\brain-proxy\profile\Default\IndexedDB\https_chat.z.ai_0.indexeddb.leveldb/MANIFEST-000001
+2026/11/19-15:58:40.760 61e8 Recovering log #10
+2026/11/19-15:58:40.761 61e8 Reusing old log C:\hermes\brain-proxy\profile\Default\IndexedDB\https_chat.z.ai_0.indexeddb.leveldb/000010.log 
+2026/11/19-15:58:40.761 61e8 Delete type=2 #8
+2026/11/19-15:58:40.769 59d4 Level-0 table #15: started
+2026/11/19-15:58:40.780 59d4 Level-0 table #15: 1076 bytes OK
+2026/11/19-15:58:40.782 59d4 Delete type=0 #10
+2026/11/19-15:58:40.782 61e8 Manual compaction at level-0 from '\x00\x04\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00\x05\x00\x00\x00' @ 0 : 0; will stop at '\x00\x04\x00\x00\xc8\x04\x00d\x00a\x00t\x00a' @ 212 : 1
+2026/11/19-15:58:40.783 61e8 Compacting 1@0 + 1@1 files
+2026/11/19-15:58:40.798 61e8 Generated table #16@0: 21 keys, 628 bytes
+2026/11/19-15:58:40.798 61e8 Compacted 1@0 + 1@1 files => 628 bytes
+2026/11/19-15:58:40.799 61e8 compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/11/19-15:58:40.800 61e8 Delete type=2 #15
+2026/11/19-15:58:40.800 61e8 Manual compaction at level-0 from '\x00\x04\x00\x00\xc8\x04\x00d\x00a\x00t\x00a' @ 212 : 1 .. '\x00\x05\x00\x00\x00' @ 0 : 0; will stop at (end)

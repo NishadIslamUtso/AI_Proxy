@@ -1,5 +1,5 @@
 import asyncio, sys
-from playwright.async_api import async_playwright
+from patchright.async_api import async_playwright
 
 async def main():
     site = sys.argv[1] if len(sys.argv) > 1 else "https://chatgpt.com/"

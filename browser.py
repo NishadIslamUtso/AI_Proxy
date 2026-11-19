@@ -12,7 +12,7 @@ import time
 import uuid
 from pathlib import Path
 
-from playwright.async_api import async_playwright
+from patchright.async_api import async_playwright
 
 from breaker import Breaker
 from errors import BrainError, COOLDOWN, TRANSIENT, classify
@@ -56,6 +56,9 @@ BRAIN_PREAMBLE_PLAIN = (
 )
 
 
+_SHARED = {"pw": None, "ctx": None}
+
+
 class BrainBrowser:
     def __init__(self, name, cfg, browser_cfg):
         self.name = name
@@ -72,11 +75,11 @@ class BrainBrowser:
         self.strip_patterns = cfg.get("strip_patterns") or []
         self.file_input_selectors = cfg.get("file_input_selectors") or ["input[type='file']"]
 
-        self.cdp_url = browser_cfg["cdp_url"]
+        self.user_data_dir = browser_cfg["user_data_dir"]
         self.executable_path = browser_cfg.get("executable_path") or ""
-        self.headless = bool(browser_cfg.get("headless", False))
-
+        self._context = None
         self._pw = None
+
         self._browser = None
         self._page = None
         self.ready = False
@@ -122,38 +125,48 @@ class BrainBrowser:
                 return
             self.ready = False
 
-        if self._browser is None:
-            self._pw = await async_playwright().start()
-            self._browser = await self._pw.chromium.connect_over_cdp(self.cdp_url)
-            ctx = self._browser.contexts[0] if self._browser.contexts else await self._browser.new_context()
-            await ctx.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-                "Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});"
-                "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});"
-            )
-        ctx = self._browser.contexts[0]
         base = self.url.split("?")[0].rstrip("/")
+        if self.session_url and not self.session_url.startswith(base):
+            self.session_url = ""
 
-        # 1. remembered session tab, if alive
+        if self._context is None:
+            if _SHARED["ctx"] is not None:
+                # one browser for every brain: a second persistent context on
+                # the same profile would fail with "existing browser session"
+                self._context = _SHARED["ctx"]
+                self._pw = _SHARED["pw"]
+            else:
+                self._pw = await async_playwright().start()
+                self._context = await self._pw.chromium.launch_persistent_context(
+                    user_data_dir=self.user_data_dir,
+                    headless=False,
+                    executable_path=self.executable_path or None,
+                    args=["--disable-blink-features=AutomationControlled"],
+                    viewport={"width": 1280, "height": 900},
+                )
+                await self._context.add_init_script(
+                    "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                )
+                _SHARED["ctx"] = self._context
+                _SHARED["pw"] = self._pw
+
+        ctx = self._context
         if self.session_url:
             for p in ctx.pages:
                 if p.url == self.session_url and await self._page_alive(p):
                     self._page = p
                     await p.bring_to_front()
                     self.ready = True
+                    print(f"[brain-proxy] {self.name} resumed {p.url}", flush=True)
                     return
-
-        # 2. any live tab on the same origin
         for p in ctx.pages:
             if p.url.startswith(base) and await self._page_alive(p):
                 self._page = p
                 self.session_url = p.url
                 await p.bring_to_front()
                 self.ready = True
-                print(f"[brain-proxy] {self.name} attached to live tab {p.url}", flush=True)
+                print(f"[brain-proxy] {self.name} attached {p.url}", flush=True)
                 return
-
-        # 3. open a fresh tab
         page = await ctx.new_page()
         await page.goto(self.url, wait_until="domcontentloaded")
         try:
@@ -164,12 +177,12 @@ class BrainBrowser:
         self.session_url = page.url
         await page.bring_to_front()
         self.ready = True
-        print(f"[brain-proxy] {self.name} opened new tab {page.url}", flush=True)
+        print(f"[brain-proxy] {self.name} opened {page.url}", flush=True)
 
     async def close(self):
         try:
-            if self._browser:
-                await self._browser.close()
+            if self._context:
+                await self._context.close()
         except Exception:
             pass
         try:
@@ -178,8 +191,11 @@ class BrainBrowser:
         except Exception:
             pass
         self._page = None
+        self._context = None
         self._browser = None
         self._pw = None
+        _SHARED["ctx"] = None
+        _SHARED["pw"] = None
 
     # ---------- helpers ----------
 
@@ -197,9 +213,7 @@ class BrainBrowser:
                         el_cls = (await el.get_attribute("class")) or ""
                         if "recaptcha" in el_id.lower():
                             continue
-                        if "recaptcha" in el_cls.lower():
-                            continue
-                        if "hidden" in el_cls.lower():
+                        if re.search(r"(^|\s)hidden(\s|$)", el_cls, re.I):
                             continue
                         return el
                     except Exception:
@@ -329,9 +343,11 @@ class BrainBrowser:
                 el = loc.nth(i)
                 if not (await el.is_visible() and await el.is_enabled()):
                     continue
-                ident = ((await el.get_attribute("id") or "") +
+                ident = ((await el.get_attribute("id") or "") + " " +
                          (await el.get_attribute("class") or "")).lower()
-                if "recaptcha" in ident or "hidden" in ident:
+                if "recaptcha" in ident:
+                    continue
+                if re.search(r"(^|\s)hidden(\s|$)", ident):
                     continue
                 return el
         return None

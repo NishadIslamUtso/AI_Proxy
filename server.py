@@ -383,7 +383,7 @@ async def list_tabs(brain: str):
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
     out = []
-    for p in b._browser.contexts[0].pages:
+    for p in b._context.pages:
         try:
             alive = await b._page_alive(p)
         except Exception:

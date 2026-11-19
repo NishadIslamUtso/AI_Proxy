@@ -1,21 +1,6 @@
 {
-  "chatgpt": {
-    "session_url": "https://chatgpt.com/c/6afddb07-a398-83ee-b963-c1947cc06008",
-    "input": [],
-    "response": []
-  },
-  "arena-chat": {
-    "session_url": "https://arena.ai/agent/01a1f2fa-d6af-7afa-a8ec-a87cf0c3799e",
-    "input": [],
-    "response": []
-  },
-  "arena-agent": {
-    "session_url": "https://arena.ai/agent/01a1f2fa-d6af-7afa-a8ec-a87cf0c3799e",
-    "input": [],
-    "response": []
-  },
-  "deepseek": {
-    "session_url": "https://chat.deepseek.com/a/chat/s/0701fe7a-8eba-4673-b3f3-55457fbf4180",
+  "zai": {
+    "session_url": "https://chat.z.ai/c/4c0b5ccc-9010-4b83-9478-7e85b4877dfc",
     "input": [],
     "response": []
   }

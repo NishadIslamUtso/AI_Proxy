@@ -16,8 +16,6 @@ Start-Sleep -Seconds 2
 
 Start-Process -FilePath $brave -ArgumentList @(
   "--user-data-dir=$dir",
-  "--remote-debugging-port=9222",
-  "--remote-allow-origins=*",
   "--no-first-run",
   "--no-default-browser-check",
   "about:blank"
