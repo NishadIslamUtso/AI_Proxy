@@ -76,6 +76,24 @@ curl "http://127.0.0.1:8000/debug/dump?brain=chatgpt"
 Returns the page URL, every input box, and recent message containers. Use it to
 fix selectors when a site redesigns.
 
+## Related projects (this space already exists)
+
+Audited 2026-11-19. The idea is not new — but most public tools do it a
+different way, and the difference matters.
+
+| Project | Approach | Verdict |
+|---|---|---|
+| **ia-web-parser** (PyPI) | Harvest the browser session once (Playwright), then call the provider's **own internal HTTP API** with those cookies. Streaming + `<tool_call>` parsing. | **Best of the bunch.** Fast, no DOM typing, supports Claude/Kimi/Gemini/DeepSeek/Qwen. |
+| **siwc-proxy** (PyPI) | "Sign in with ChatGPT" token sharing + a real OAuth client; serves `/v1/chat/completions` and `/v1/responses`. | Cleanest auth story, but ChatGPT-only and needs a sign-in. |
+| **ChatGPT-Web2API** (Octo-Lex, MartinezS8) | CDP-driven Chrome, types messages / clicks send / reads responses. OpenAI-compatible + MCP server. | Same architecture as this project. Confirms the approach; same brittleness. |
+| **LLM-chat-scraper**, **duck_chat**, **chatsmith-api** | Reverse-engineered provider clients / scrapers. | Narrow, per-provider, need an API key for some. |
+
+**The lesson:** the reliable tools do not drive the DOM. They reuse the
+harvested session and call the backend API directly. DOM typing (what
+`browser.py` does) is the simplest to build and the first to break — which is
+exactly the flakiness seen with empty replies. The next iteration should
+harvest the session and call the provider's API instead.
+
 ## Costs
 
 Every call is a browser round trip: **20–90 seconds**. Hermes calls the model
