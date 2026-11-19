@@ -1,0 +1,76 @@
+# brain-proxy configuration
+host: 127.0.0.1
+port: 8000
+default: chatgpt
+
+# Turn budget per web chat thread. At the limit the proxy asks the brain for a
+# summary, opens a fresh chat, and seeds it with that summary.
+max_turns_per_thread: 40
+reanchor_every: 10
+
+# Try these brains in order when one fails.
+escalation:
+  - chatgpt
+  - arena-agent
+
+# The browser the proxy drives. Dedicated profile + dedicated CDP port so it
+# never fights Hermes's own browser (which is on 9222).
+browser:
+  cdp_url: http://127.0.0.1:9223
+  executable_path: "C:/Program Files/BraveSoftware/Brave-Browser/Application/brave.exe"
+  headless: false
+
+# Per-tool truncation. Tool output longer than this is head+tail trimmed.
+tool_truncation:
+  read_file: 8000
+  run_cmd: 6000
+  grep: 8000
+  list_dir: 8000
+  default: 8000
+
+brains:
+  chatgpt:
+    url: https://chatgpt.com/
+    input_selectors:
+      - ".ProseMirror"
+      - "div#prompt-textarea"
+      - "div[contenteditable='true']"
+      - "textarea"
+    response_selectors:
+      - "div[data-message-author-role='assistant']"
+    submit_selectors:
+      - "button[data-testid='send-button']"
+      - "button[aria-label*='Send']"
+    submit_key: "Enter"
+    done_when_gone:
+      - "button[data-testid='stop-button']"
+      - "button[aria-label*='Stop']"
+
+  arena-sonnet:
+    url: "https://arena.ai/code/direct?model_a=claude-sonnet-5-5-high"
+    input_selectors:
+      - "textarea"
+    response_selectors:
+      - ".prose"
+      - "[class*='markdown']"
+    submit_selectors:
+      - "button[aria-label='Send message']"
+      - "button[type='submit']"
+    submit_key: "Enter"
+    done_when_gone: []
+
+  arena-agent:
+    url: "https://arena.ai/agent"
+    notes: "Arena agent mode - built for complex tasks"
+    input_selectors:
+      - "textarea"
+      - "[contenteditable='true']"
+    response_selectors:
+      - ".prose"
+      - "[class*='markdown']"
+    submit_selectors:
+      - "button[aria-label='Send message']"
+      - "button[type='submit']"
+      - "button[aria-label*='Send']"
+    submit_key: "Enter"
+    done_when_gone: []

@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+out.log
+err.log
+brain-proxy.log
+attachments/
+last-request.json
+last-tools-block.txt
+*.lnk
