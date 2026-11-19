@@ -94,50 +94,62 @@ class BrainBrowser:
 
     # ---------- lifecycle ----------
 
+    async def _page_alive(self, page, timeout=4.0):
+        try:
+            await asyncio.wait_for(page.evaluate("() => 1"), timeout=timeout)
+            return not page.is_closed()
+        except Exception:
+            return False
+
     async def _connect(self):
-        if self._page is not None and not self._page.is_closed():
-            return
-        self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.connect_over_cdp(self.cdp_url)
-        ctx = self._browser.contexts[0] if self._browser.contexts else await self._browser.new_context()
-        await ctx.add_init_script(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-            "Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});"
-            "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});"
-        )
-        candidates = [self.session_url] if self.session_url else []
+        if self.ready and self._page is not None:
+            if await self._page_alive(self._page):
+                return
+            self.ready = False
+
+        if self._browser is None:
+            self._pw = await async_playwright().start()
+            self._browser = await self._pw.chromium.connect_over_cdp(self.cdp_url)
+            ctx = self._browser.contexts[0] if self._browser.contexts else await self._browser.new_context()
+            await ctx.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                "Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});"
+                "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});"
+            )
+        ctx = self._browser.contexts[0]
         base = self.url.split("?")[0].rstrip("/")
-        for p in ctx.pages:
-            if p.url.rstrip("/") == base.rstrip("/"):
-                candidates.append(p.url)
-                break
-        for p in ctx.pages:
-            if p.url.startswith(base):
-                candidates.append(p.url)
-                break
-        page = None
-        for u in candidates:
+
+        # 1. remembered session tab, if alive
+        if self.session_url:
             for p in ctx.pages:
-                if p.url == u:
-                    page = p
-                    break
-            if page:
-                break
-        if page is None:
-            page = await ctx.new_page()
-            await page.goto(self.url, wait_until="domcontentloaded")
-            try:
-                await page.wait_for_load_state("networkidle", timeout=15000)
-            except Exception:
-                pass
+                if p.url == self.session_url and await self._page_alive(p):
+                    self._page = p
+                    await p.bring_to_front()
+                    self.ready = True
+                    return
+
+        # 2. any live tab on the same origin
+        for p in ctx.pages:
+            if p.url.startswith(base) and await self._page_alive(p):
+                self._page = p
+                self.session_url = p.url
+                await p.bring_to_front()
+                self.ready = True
+                print(f"[brain-proxy] {self.name} attached to live tab {p.url}", flush=True)
+                return
+
+        # 3. open a fresh tab
+        page = await ctx.new_page()
+        await page.goto(self.url, wait_until="domcontentloaded")
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
         self._page = page
+        self.session_url = page.url
         await page.bring_to_front()
-        if not page.url.startswith("http"):
-            await page.goto(self.url, wait_until="domcontentloaded")
-            try:
-                await page.wait_for_load_state("networkidle", timeout=15000)
-            except Exception:
-                pass
+        self.ready = True
+        print(f"[brain-proxy] {self.name} opened new tab {page.url}", flush=True)
 
     async def close(self):
         try:
@@ -418,6 +430,20 @@ class BrainBrowser:
 
     async def ask(self, prompt, files=None):
         """Send one prompt to the web chat and return its reply."""
+        for _attempt in range(2):
+            try:
+                return await self._ask_once(prompt, files)
+            except Exception as e:
+                if _attempt == 0:
+                    print(f"[brain-proxy] {self.name} ask failed, retrying on fresh tab: {e}", flush=True)
+                    self.session_url = ""
+                    self.ready = False
+                    self._page = None
+                    await asyncio.sleep(2)
+                    continue
+                raise
+
+    async def _ask_once(self, prompt, files=None):
         async with self._lock:
             await self._connect()
             await self._check_auth()

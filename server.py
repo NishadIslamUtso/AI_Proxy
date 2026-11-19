@@ -319,6 +319,25 @@ async def list_sessions():
     return out
 
 
+@app.get("/debug/tabs")
+async def list_tabs(brain: str):
+    if brain not in BROWSERS:
+        return JSONResponse(status_code=404, content={"error": "unknown brain"})
+    b = BROWSERS[brain]
+    try:
+        await b._connect()
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    out = []
+    for p in b._browser.contexts[0].pages:
+        try:
+            alive = await b._page_alive(p)
+        except Exception:
+            alive = False
+        out.append({"url": p.url, "alive": alive, "current": p is b._page})
+    return {"brain": brain, "session_url": getattr(b, "session_url", ""), "tabs": out}
+
+
 @app.post("/debug/switch")
 async def switch_default(request: Request):
     body = await request.json()
