@@ -247,6 +247,17 @@ class BrainBrowser:
                 await asyncio.sleep(0.6)
         except Exception:
             pass
+        # cookie / consent wall: never auto-accept, surface it instead
+        try:
+            for sel in ("text=I accept", "text=Accept all", "text=Accept cookies",
+                        "text=Agree", "button:has-text(\"Accept\")"):
+                if await self._page.locator(sel).count():
+                    raise BrainError("consent_wall",
+                                     f"{self.name} has a consent dialog", self.name)
+        except BrainError:
+            raise
+        except Exception:
+            pass
 
     async def _continue_generating(self):
         for txt in ("Continue generating", "Keep generating", "Show more"):
