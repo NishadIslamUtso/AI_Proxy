@@ -18,7 +18,7 @@ TRANSIENT = {"upstream_offline", "cdp_dead", "tab_dead", "send_failed",
 
 # Retrying will not help; the human has to do something or the brain must be skipped.
 FAIL_FAST = {"auth_wall", "captcha", "rate_limited", "site_changed", "user_tab_busy",
-             "consent_wall"}
+             "consent_wall", "paused"}
 
 # How long a brain stays benched when this code trips the breaker.
 COOLDOWN = {

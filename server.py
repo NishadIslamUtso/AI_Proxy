@@ -323,6 +323,8 @@ async def brain_call(name, prompt, max_wait=600, files=None):
         if brain not in CFG["brains"]:
             continue
         b = await get_browser(brain)
+        if getattr(b, "paused", False):
+            raise BrainError("paused", f"{brain} is paused by user", brain)
         if not b.breaker.allow():
             st = b.breaker.as_dict()
             print(f"[brain-proxy] {brain} skipped: circuit {st['state']} "
@@ -338,6 +340,9 @@ async def brain_call(name, prompt, max_wait=600, files=None):
             last = e
             record(brain, e.code, (time.time() - t0) * 1000, ok=False)
             print(f"[brain-proxy] {brain} [{e.code}]: {e}", flush=True)
+            if e.code == "paused":
+                # a user pause is a hard stop, not a reason to fail over
+                raise
         except Exception as e:  # noqa: BLE001
             code = classify(e)
             last = BrainError(code, f"{type(e).__name__}: {e}", brain)
@@ -460,6 +465,67 @@ async def tool_test(brain: str):
     except Exception as e:
         return JSONResponse(status_code=500,
                             content={"error": f"{type(e).__name__}: {e}"})
+
+
+@app.post("/debug/pause")
+async def pause_brain(request: Request):
+    body = await request.json()
+    name = body.get("brain")
+    if name not in CFG["brains"]:
+        return JSONResponse(status_code=404, content={"error": "unknown brain"})
+    b = await get_browser(name)
+    b.paused = True
+    b.breaker.fail("paused", COOLDOWN.get("paused", 3600))
+    return {"ok": True, "brain": name, "paused": True,
+            "current_url": b.session_url or b.url}
+
+
+@app.post("/debug/adopt")
+async def adopt_tab(request: Request):
+    from urllib.parse import urlparse
+    body = await request.json()
+    name = body.get("brain")
+    if name not in CFG["brains"]:
+        return JSONResponse(status_code=404, content={"error": "unknown brain"})
+    b = await get_browser(name)
+    await b._connect()
+    host = urlparse(b.url).netloc
+    adopted = None
+    for p in b._context.pages:
+        try:
+            if p.url.startswith("http") and host in p.url and await b._page_alive(p):
+                adopted = p
+                break
+        except Exception:
+            continue
+    if adopted is None:
+        return JSONResponse(status_code=404,
+                            content={"error": f"no live tab on {host}"})
+    b._page = adopted
+    b.session_url = adopted.url
+    b.url = adopted.url
+    b.paused = False
+    b.breaker.ok()
+    b._save_learned()
+    return {"ok": True, "brain": name, "paused": False,
+            "adopted_url": adopted.url, "breaker": "closed"}
+
+
+@app.get("/debug/state")
+async def debug_state(brain: str):
+    if brain not in CFG["brains"]:
+        return JSONResponse(status_code=404, content={"error": "unknown brain"})
+    b = BROWSERS.get(brain)
+    if b is None:
+        return {"brain": brain, "instantiated": False}
+    return {
+        "brain": brain,
+        "instantiated": True,
+        "paused": getattr(b, "paused", False),
+        "url": b.url,
+        "session_url": b.session_url,
+        "breaker": b.breaker.as_dict(),
+    }
 
 
 @app.get("/debug/selfcheck")

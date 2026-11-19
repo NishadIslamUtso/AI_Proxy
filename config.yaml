@@ -82,21 +82,6 @@ brains:
     submit_key: "Enter"
     done_when_gone:
       - "button[aria-label*='Stop']"
-  arena-sonnet:
-    url: "https://arena.ai/code/direct?model_a=claude-sonnet-5-5-high"
-    input_selectors:
-      - ".tiptap.ProseMirror"
-      - "div.tiptap[contenteditable='true']"
-      - "main div[contenteditable='true']"
-    response_selectors:
-      - "main .prose:not(.tiptap)"
-      - "main [class*='markdown']:not(.tiptap)"
-    submit_selectors:
-      - "button[aria-label*='Send']"
-      - "form button[type='submit']"
-    submit_key: "Enter"
-    done_when_gone:
-      - "button[aria-label*='Stop']"
   arena-gpt5:
     url: "https://arena.ai/code/direct?model_a=gpt-5-high"
     input_selectors:
@@ -179,6 +164,8 @@ brains:
     done_when_gone:
       - "button[aria-label='Stop']"
     strip_patterns:
+      - "^Show full message\\s*\\n+"
+      - "\\n+Show full message\\s*$"
       - "^Thought for \\d+\\s*(?:second|minute)s?\\s*\\n+"
       - "^Thinking\\.{0,3}\\s*\\n+"
       - "^Thought Process\\s*\\n+"

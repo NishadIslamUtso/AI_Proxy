@@ -75,6 +75,7 @@ class BrainBrowser:
         self.auth_urls = cfg.get("auth_urls", [])
         self.auth_selectors = cfg.get("auth_selectors", [])
         self.strip_patterns = cfg.get("strip_patterns") or []
+        self.paused = False
         self.file_input_selectors = cfg.get("file_input_selectors") or ["input[type='file']"]
 
         self.user_data_dir = browser_cfg["user_data_dir"]
@@ -741,6 +742,8 @@ class BrainBrowser:
 
     async def ask(self, prompt, files=None):
         """Send one prompt to the web chat and return its reply."""
+        if self.paused:
+            raise BrainError("paused", f"{self.name} is paused by user", self.name)
         last = None
         for attempt in range(2):
             try:
