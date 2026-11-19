@@ -18,7 +18,7 @@ helper:
     HERMES_PROXY_GUARD: "1"
     HERMES_MODEL_PROVIDER: "nous"
     HERMES_MODEL_DEFAULT: "qwen/qwen4-max:free"
-  cli_timeout_seconds: 300
+  cli_timeout_seconds: 120
   role_prompt: |
     You are a helper subprocess inside an agent framework.
     Rules, enforced:
@@ -45,7 +45,7 @@ helper:
     - proxy_escalation_failed
     - hard_timeout
 
-hard_timeout_seconds: 300
+hard_timeout_seconds: 120
 
 # Turn budget per web chat thread. At the limit the proxy asks the brain for a
 # summary, opens a fresh chat, and seeds it with that summary.
@@ -56,7 +56,7 @@ reanchor_every: 10
 escalation: []
 escalation_enabled: false
 max_concurrent: 4
-max_wait_seconds: 180
+max_wait_seconds: 90
 
 # The browser the proxy drives. Dedicated profile + dedicated CDP port so it
 # never fights Hermes's own browser (which is on 9222).

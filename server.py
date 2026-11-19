@@ -886,15 +886,31 @@ async def chat_completions(request: Request):
     _ACTIVE.release()
 
     if body.get("tools") and not reply_looks_like_tool_json(reply):
-        print("[brain-proxy] tool JSON missing, delegating to helper",
-              flush=True)
-        _h = await call_helper(
-            messages,
-            tools=body.get("tools"),
-            kind="tool_json",
+        retry_prompt = (
+            "Your previous reply was prose. You must reply with "
+            "exactly one JSON object on its own: "
+            '{"tool": "<name>", "args": {...}} or {"final": "..."}. '
+            "Do not add any other text before or after. Retry for: "
+            + content_to_text(messages[-1].get("content", ""))
         )
-        if _h is not None:
-            reply = _h
+        try:
+            _r = await asyncio.wait_for(
+                brain_call(served or model_name, retry_prompt),
+                timeout=60,
+            )
+            reply = _r[0] if isinstance(_r, tuple) else _r
+        except Exception:
+            pass
+        if not reply_looks_like_tool_json(reply):
+            print("[brain-proxy] tool JSON still missing, delegating to helper",
+                  flush=True)
+            _h = await call_helper(
+                messages,
+                tools=body.get("tools"),
+                kind="tool_json",
+            )
+            if _h is not None:
+                reply = _h
 
     parsed = parse_tool_reply(sanitize(reply))
     usage = {
