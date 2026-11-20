@@ -400,6 +400,9 @@ async def brain_call(name, prompt, max_wait=None, files=None):
     """Call a brain, escalating through the configured fallback list."""
     if max_wait is None:
         max_wait = int(CFG.get("max_wait_seconds", 180))
+    _bcfg = CFG["brains"].get(name) or {}
+    if _bcfg.get("mode") == "agent":
+        max_wait = int(_bcfg.get("agent_deadline", 7200))
     if CFG.get("escalation_enabled", False):
         order = [name] + [b for b in CFG.get("escalation", []) if b != name]
     else:
@@ -815,62 +818,92 @@ async def chat_completions(request: Request):
 
     if stream:
         async def gen():
+            head = {
+                "id": response_id, "object": "chat.completion.chunk",
+                "created": created, "model": model_name,
+                "choices": [{"index": 0,
+                             "delta": {"role": "assistant", "content": ""},
+                             "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(head)}\n\n"
+
             task = asyncio.create_task(run_brain())
             while not task.done():
-                yield ": keep-alive\n\n"
-                await asyncio.sleep(5)
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=15)
+                    break
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+
             try:
-                reply, _ = await task
-            except Exception as e:  # noqa: BLE001
-                yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'proxy_error'}})}\n\n"
+                reply, served = task.result()
+            except BrainError as e:
+                err = {"error": {"message": str(e), "type": "brain_proxy_error",
+                                 "code": e.code}}
+                yield f"data: {json.dumps(err)}\n\n"
                 yield "data: [DONE]\n\n"
                 return
+            except Exception as e:
+                err = {"error": {"message": str(e), "type": "proxy_error"}}
+                yield f"data: {json.dumps(err)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
             parsed = parse_tool_reply(sanitize(reply))
-            if "tool_calls" in parsed:
-                tc = parsed["tool_calls"][0]
-                chunk = {
-                    "id": response_id, "object": "chat.completion.chunk",
-                    "created": created, "model": model_name,
-                    "choices": [{"index": 0, "delta": {
-                        "tool_calls": [{
+            if isinstance(parsed, dict) and "tool_calls" in parsed:
+                for tc in parsed["tool_calls"]:
+                    chunk = {
+                        "id": response_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model_name,
+                        "choices": [{"index": 0, "delta": {"tool_calls": [{
                             "index": 0, "id": tc["id"], "type": "function",
                             "function": {"name": tc["function"]["name"],
                                          "arguments": tc["function"]["arguments"]},
-                        }]
-                    }, "finish_reason": None}],
-                }
-                yield f"data: {json.dumps(chunk)}\n\n"
-                end = {
+                        }]}, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                tail = {
                     "id": response_id, "object": "chat.completion.chunk",
                     "created": created, "model": model_name,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
                 }
-                yield f"data: {json.dumps(end)}\n\n"
+                yield f"data: {json.dumps(tail)}\n\n"
                 yield "data: [DONE]\n\n"
                 return
-            content = parsed["final"]
-            for i in range(0, max(len(content), 1), 200):
+
+            text = parsed.get("final", reply) if isinstance(parsed, dict) else reply
+            if not isinstance(text, str):
+                text = reply
+            for i in range(0, len(text), 200):
                 chunk = {
                     "id": response_id, "object": "chat.completion.chunk",
                     "created": created, "model": model_name,
                     "choices": [{"index": 0,
-                                 "delta": {"content": content[i:i + 200]},
+                                 "delta": {"content": text[i:i+200]},
                                  "finish_reason": None}],
                 }
                 yield f"data: {json.dumps(chunk)}\n\n"
                 await asyncio.sleep(0.02)
-            end = {
+            tail = {
                 "id": response_id, "object": "chat.completion.chunk",
                 "created": created, "model": model_name,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
             }
-            yield f"data: {json.dumps(end)}\n\n"
+            yield f"data: {json.dumps(tail)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
+    _mode = (CFG["brains"].get(model_name) or {}).get("mode", "chat")
+    _ht = int(CFG.get("hard_timeout_seconds", 300))
+    if _mode == "agent":
+        _ht = int((CFG["brains"].get(model_name) or {}).get("agent_deadline", 7200)) + 300
+
     try:
-        reply, served = await run_brain()
+        reply, served = await asyncio.wait_for(
+            run_brain(),
+            timeout=_ht,
+        )
     except BrainError as e:
         _ACTIVE.release()
         status = {"rate_limited": 429, "captcha": 409, "auth_wall": 409,
