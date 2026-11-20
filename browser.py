@@ -276,6 +276,40 @@ class BrainBrowser:
             return False
         return a.rstrip("/").split("?")[0] == b.rstrip("/").split("?")[0]
 
+    async def _context_alive(self):
+        """Is the shared browser process still running?
+
+        The context object outlives the process: after the browser is closed
+        (by the user, by a crash, or by a kill) the handle is still non-None
+        but every call on it fails with TargetClosedError. That must read as
+        dead, or the proxy reuses a corpse forever and never relaunches.
+        """
+        ctx = self._context
+        if ctx is None:
+            return False
+        try:
+            browser = ctx.browser
+            if browser is None or not browser.is_connected():
+                return False
+        except Exception:
+            return False
+        return True
+
+    async def _drop_dead_context(self):
+        """Forget a dead browser so the next connect launches a fresh one."""
+        ctx, self._context = self._context, None
+        self._pw = None
+        self.ready = False
+        self._page = None
+        if _SHARED.get("ctx") is not None:
+            _SHARED["ctx"] = None
+            _SHARED["pw"] = None
+        if ctx is not None:
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+
     async def _connect(self, url=None):
         """Attach to this brain's page, optionally on a specific thread.
 
@@ -302,6 +336,13 @@ class BrainBrowser:
         base = self.url.split("?")[0].rstrip("/")
         if self.session_url and not self.session_url.startswith(base):
             self.session_url = ""
+
+        # The browser may have been closed since we last used it. Dropping the
+        # stale handle here is what lets the proxy recover on its own.
+        if self._context is not None and not await self._context_alive():
+            print(f"[brain-proxy] {self.name}: browser process is gone, "
+                  f"relaunching", flush=True)
+            await self._drop_dead_context()
 
         if self._context is None:
             if _SHARED["ctx"] is not None:

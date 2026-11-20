@@ -366,5 +366,68 @@ class TestHumanIntervention:
         assert failed == []
 
 
+class TestDeadBrowserRecovery:
+    """A killed browser must not wedge the proxy forever."""
+
+    def test_a_live_context_reads_as_alive(self, brain):
+        class Browser:
+            def is_connected(self):
+                return True
+
+        brain._context = type("C", (), {"browser": Browser()})()
+        assert _run(brain._context_alive()) is True
+
+    def test_a_closed_browser_reads_as_dead(self, brain):
+        class Browser:
+            def is_connected(self):
+                return False
+
+        brain._context = type("C", (), {"browser": Browser()})()
+        assert _run(brain._context_alive()) is False
+
+    def test_a_context_with_no_browser_reads_as_dead(self, brain):
+        brain._context = type("C", (), {"browser": None})()
+        assert _run(brain._context_alive()) is False
+
+    def test_an_exploding_property_reads_as_dead(self, brain):
+        class Ctx:
+            @property
+            def browser(self):
+                raise RuntimeError("TargetClosedError")
+
+        brain._context = Ctx()
+        assert _run(brain._context_alive()) is False
+
+    def test_dropping_a_dead_context_clears_every_handle(self, brain,
+                                                         monkeypatch):
+        import browser as browser_mod
+
+        closed = []
+
+        class Ctx:
+            browser = None
+
+            async def close(self):
+                closed.append(True)
+
+        stale = Ctx()
+        brain._context = stale
+        brain._pw = object()
+        brain.ready = True
+        brain._page = object()
+        monkeypatch.setitem(browser_mod._SHARED, "ctx", stale)
+        monkeypatch.setitem(browser_mod._SHARED, "pw", object())
+
+        _run(brain._drop_dead_context())
+
+        assert brain._context is None
+        assert brain._pw is None
+        assert brain.ready is False
+        assert brain._page is None
+        assert browser_mod._SHARED["ctx"] is None
+        assert browser_mod._SHARED["pw"] is None
+        assert closed == [True]
+
+
 async def _async(value):
     return value
