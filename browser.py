@@ -12,6 +12,7 @@ import os
 import random
 import random as _random
 import re
+import subprocess as _subprocess
 import time
 import uuid
 from pathlib import Path
@@ -125,6 +126,10 @@ _SHARED = {"pw": None, "ctx": None}
 # navigator.webdriver is hidden by the init script at launch instead, which
 # leaves nothing behind in the browser's own command line.
 IGNORE_DEFAULT_ARGS = ["--disable-blink-features=AutomationControlled"]
+
+# Extra arguments for the browser process. Deliberately empty: every flag
+# Playwright does not add itself is a potential automation tell.
+LAUNCH_ARGS = []
 
 
 class BrainBrowser:
@@ -283,17 +288,92 @@ class BrainBrowser:
         (by the user, by a crash, or by a kill) the handle is still non-None
         but every call on it fails with TargetClosedError. That must read as
         dead, or the proxy reuses a corpse forever and never relaunches.
+
+        is_connected() can flap once under load, so a single False is confirmed
+        before declaring the browser dead - dropping a healthy context would
+        kill the window the user is looking at.
         """
         ctx = self._context
         if ctx is None:
             return False
-        try:
-            browser = ctx.browser
-            if browser is None or not browser.is_connected():
-                return False
-        except Exception:
+        for attempt in range(2):
+            try:
+                browser = ctx.browser
+                if browser is not None and browser.is_connected():
+                    return True
+            except Exception:
+                pass
+            if attempt == 0:
+                time.sleep(1.0)
+        return False
+
+    async def browser_needs_relaunch(self):
+        """True only when a browser existed and its process has since died.
+
+        Distinct from "never launched": an open circuit must not be reset for a
+        brain that simply has not been used yet.
+        """
+        if self._context is None:
             return False
-        return True
+        return not await self._context_alive()
+
+    def _kill_profile_holders(self):
+        """Kill any Chromium still holding our profile.
+
+        A hard kill, or a browser still shutting down, leaves the profile
+        locked; the next launch then fails with "Opening in existing browser
+        session" and nothing recovers. Only processes whose command line names
+        THIS profile are touched.
+        """
+        try:
+            ps = ("Get-CimInstance Win32_Process -Filter \"name='brave.exe'\" | "
+                  "Where-Object { $_.CommandLine -like '*" + self.user_data_dir +
+                  "*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force "
+                  "-ErrorAction SilentlyContinue }")
+            _subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                            capture_output=True, timeout=30)
+        except Exception as e:  # noqa: BLE001
+            print(f"[brain-proxy] {self.name}: could not clear profile holders: "
+                  f"{type(e).__name__}: {e}", flush=True)
+
+    async def _launch_browser(self):
+        """Launch the persistent context, tolerating a locked profile.
+
+        Order: with the sandbox, then without it (a machine that cannot
+        sandbox must still work). A locked profile is cleared and retried.
+        """
+        sandbox = bool(self.browser_cfg.get("sandbox", True))
+        options = [True, False] if sandbox else [False]
+        last = None
+        for sb in options:
+            for _ in range(2):
+                try:
+                    return await self._pw.chromium.launch_persistent_context(
+                        user_data_dir=self.user_data_dir,
+                        headless=False,
+                        executable_path=self.executable_path or None,
+                        no_viewport=True,
+                        chromium_sandbox=sb,
+                        args=LAUNCH_ARGS,
+                        ignore_default_args=IGNORE_DEFAULT_ARGS,
+                    )
+                except Exception as e:
+                    last = e
+                    msg = str(e)
+                    if ("existing browser session" in msg
+                            or "profile is already in use" in msg):
+                        print(f"[brain-proxy] {self.name}: profile is locked, "
+                              f"clearing the holder and retrying", flush=True)
+                        self._kill_profile_holders()
+                        continue
+                    if sb:
+                        print(f"[brain-proxy] {self.name}: sandbox unavailable "
+                              f"({type(e).__name__}: "
+                              f"{msg.splitlines()[0][:160]}), retrying without it",
+                              flush=True)
+                        break
+                    raise
+        raise last
 
     async def _drop_dead_context(self):
         """Forget a dead browser so the next connect launches a fresh one."""
@@ -352,44 +432,7 @@ class BrainBrowser:
                 self._pw = _SHARED["pw"]
             else:
                 self._pw = await async_playwright().start()
-                # Deliberately no --disable-blink-features=AutomationControlled.
-                # It is a well-known automation tell, and Brave prints a
-                # warning banner for it on every page - exactly the kind of
-                # fingerprint that gets a session flagged. navigator.webdriver
-                # is hidden by the init script below instead, which leaves
-                # nothing behind in the browser's own command line.
-                launch_args = []
-                # Playwright launches Chromium with --no-sandbox unless the
-                # sandbox is asked for explicitly. That flag shows up in the
-                # browser's own command line and in the sites' bot detection,
-                # so we ask for the sandbox and fall back if the machine
-                # cannot provide one.
-                sandbox = bool(self.browser_cfg.get("sandbox", True))
-                try:
-                    self._context = await self._pw.chromium.launch_persistent_context(
-                        user_data_dir=self.user_data_dir,
-                        headless=False,
-                        executable_path=self.executable_path or None,
-                        no_viewport=True,
-                        chromium_sandbox=sandbox,
-                        args=launch_args,
-                        ignore_default_args=IGNORE_DEFAULT_ARGS,
-                    )
-                except Exception as e:
-                    if not sandbox:
-                        raise
-                    print(f"[brain-proxy] {self.name}: sandbox unavailable "
-                          f"({type(e).__name__}: {str(e).splitlines()[0][:160]}), "
-                          f"retrying without it", flush=True)
-                    self._context = await self._pw.chromium.launch_persistent_context(
-                        user_data_dir=self.user_data_dir,
-                        headless=False,
-                        executable_path=self.executable_path or None,
-                        no_viewport=True,
-                        chromium_sandbox=False,
-                        args=launch_args,
-                        ignore_default_args=IGNORE_DEFAULT_ARGS,
-                    )
+                self._context = await self._launch_browser()
                 await self._context.add_init_script(
                     "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
                 )

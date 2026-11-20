@@ -17,7 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from browser import IGNORE_DEFAULT_ARGS, BrainBrowser  # noqa: E402
+from browser import IGNORE_DEFAULT_ARGS, LAUNCH_ARGS, BrainBrowser  # noqa: E402
 
 FORBIDDEN = (
     "--disable-blink-features=AutomationControlled",
@@ -45,16 +45,16 @@ class TestNoAutomationFlags:
             )
 
     def test_the_launch_argument_list_defaults_to_empty(self):
-        tree = _tree(BrainBrowser._connect)
-        assigned = [
-            ast.literal_eval(node.value)
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Assign)
-            and any(isinstance(t, ast.Name) and t.id == "launch_args"
-                    for t in node.targets)
+        assert LAUNCH_ARGS == []
+        tree = _tree(BrainBrowser._launch_browser)
+        passed = [
+            kw.value.id for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            for kw in node.keywords
+            if kw.arg == "args"
         ]
-        assert assigned == [[]], \
-            f"launch_args should default to empty, got {assigned!r}"
+        assert passed == ["LAUNCH_ARGS"], \
+            f"the launch should pass LAUNCH_ARGS, got {passed!r}"
 
     def test_playwrights_own_automation_flag_is_dropped(self):
         """Playwright re-adds this flag even when args is empty.
@@ -62,7 +62,7 @@ class TestNoAutomationFlags:
         It has to be removed with ignore_default_args, or Brave prints its
         warning banner on every page.
         """
-        tree = _tree(BrainBrowser._connect)
+        tree = _tree(BrainBrowser._launch_browser)
         kwargs = [
             kw.arg for node in ast.walk(tree)
             if isinstance(node, ast.Call)

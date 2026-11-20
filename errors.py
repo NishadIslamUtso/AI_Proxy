@@ -4,6 +4,8 @@ Every failure gets exactly one code so the retry policy, the circuit
 breaker and the telemetry can all key off the same string.
 """
 
+import asyncio
+
 
 class BrainError(RuntimeError):
     def __init__(self, code, msg="", brain=""):
@@ -14,7 +16,7 @@ class BrainError(RuntimeError):
 
 # Worth retrying immediately (usually a stale tab or a dropped socket).
 TRANSIENT = {"upstream_offline", "cdp_dead", "tab_dead", "send_failed",
-             "no_reply", "site_error"}
+             "no_reply", "site_error", "hard_timeout"}
 
 # Retrying will not help; the human has to do something or the brain must be skipped.
 FAIL_FAST = {"auth_wall", "captcha", "rate_limited", "site_changed", "user_tab_busy",
@@ -33,6 +35,8 @@ COOLDOWN = {
     "captcha": 600,
     "auth_wall": 600,
     "site_changed": 900,
+    # A slow brain is not a broken one; a short bench is enough.
+    "hard_timeout": 60,
 }
 
 
@@ -40,6 +44,12 @@ def classify(exc, page_title=""):
     """Map an exception (plus the current page title) to a failure code."""
     s = str(exc).lower()
     t = (page_title or "").lower()
+
+    # asyncio.TimeoutError has an empty str(), so it can only be recognised by
+    # type. Without this it falls through to the catch-all and is reported as
+    # site_changed, which benches the brain for 15 minutes over a slow reply.
+    if isinstance(exc, asyncio.TimeoutError):
+        return "hard_timeout"
 
     if "just a moment" in t or "cloudflare" in t or "verify you are human" in t:
         return "captcha"

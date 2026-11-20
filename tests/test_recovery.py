@@ -429,5 +429,95 @@ class TestDeadBrowserRecovery:
         assert closed == [True]
 
 
+    def test_no_context_means_no_relaunch(self, brain):
+        brain._context = None
+        assert _run(brain.browser_needs_relaunch()) is False
+
+    def test_a_dead_browser_means_relaunch(self, brain):
+        class Browser:
+            def is_connected(self):
+                return False
+
+        brain._context = type("C", (), {"browser": Browser()})()
+        assert _run(brain.browser_needs_relaunch()) is True
+
+
+class TestLockedProfileRecovery:
+    """A profile left locked by a killed browser must not block the relaunch."""
+
+    def test_a_locked_profile_is_cleared_and_retried(self, brain, monkeypatch):
+        calls = []
+        cleared = []
+
+        class PW:
+            class chromium:
+                @staticmethod
+                async def launch_persistent_context(**kw):
+                    calls.append(kw)
+                    if len(calls) == 1:
+                        raise RuntimeError(
+                            "BrowserType.launch_persistent_context: Opening "
+                            "in existing browser session.")
+                    return "CTX"
+
+        brain._pw = PW()
+        monkeypatch.setattr(brain, "_kill_profile_holders",
+                            lambda: cleared.append(True))
+
+        assert _run(brain._launch_browser()) == "CTX"
+        assert len(calls) == 2
+        assert cleared == [True]
+
+    def test_a_sandbox_failure_falls_back_to_no_sandbox(self, brain):
+        calls = []
+
+        class PW:
+            class chromium:
+                @staticmethod
+                async def launch_persistent_context(**kw):
+                    calls.append(kw["chromium_sandbox"])
+                    if kw["chromium_sandbox"]:
+                        raise RuntimeError("sandbox unavailable")
+                    return "CTX"
+
+        brain._pw = PW()
+        assert _run(brain._launch_browser()) == "CTX"
+        assert calls == [True, False]
+
+    def test_the_launch_passes_no_automation_arguments(self, brain):
+        seen = []
+
+        class PW:
+            class chromium:
+                @staticmethod
+                async def launch_persistent_context(**kw):
+                    seen.append(kw)
+                    return "CTX"
+
+        brain._pw = PW()
+        _run(brain._launch_browser())
+        assert seen[0]["args"] == []
+        assert "--disable-blink-features=AutomationControlled" in \
+            seen[0]["ignore_default_args"]
+
+
+class TestClassification:
+    def test_a_bare_timeout_is_not_reported_as_a_site_change(self):
+        import asyncio
+
+        from errors import classify
+
+        # asyncio.TimeoutError() has an empty str(), so it can only be
+        # recognised by type. Reporting it as site_changed would bench the
+        # brain for 15 minutes over a merely slow reply.
+        assert classify(asyncio.TimeoutError()) == "hard_timeout"
+
+    def test_hard_timeout_is_transient_with_a_short_cooldown(self):
+        from errors import COOLDOWN, TRANSIENT
+
+        assert "hard_timeout" in TRANSIENT
+        assert COOLDOWN["hard_timeout"] <= 120
+
+
 async def _async(value):
     return value

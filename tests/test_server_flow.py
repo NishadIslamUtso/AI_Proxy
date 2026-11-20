@@ -19,6 +19,8 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from breaker import Breaker  # noqa: E402
+
 
 @pytest.fixture()
 def app_mod(monkeypatch):
@@ -32,10 +34,15 @@ def app_mod(monkeypatch):
             self.paused = False
             self.max_turns = 40
             self.reanchor_every = 10
-            self.breaker = types.SimpleNamespace(allow=lambda: True,
-                                                  as_dict=lambda: {})
+            self.breaker = Breaker()
 
         def wants_rotation(self):
+            return False
+
+        async def ask(self, prompt, files=None, task_id=None):
+            raise NotImplementedError
+
+        async def browser_needs_relaunch(self):
             return False
 
     stub.BrainBrowser = BrainBrowser
@@ -339,6 +346,58 @@ class TestConcurrencyAccounting:
         out = _body(asyncio.run(mod.chat_completions(_FakeReq(_request_body()))))
         assert "error" in out
         assert mod._ACTIVE._value == before
+
+
+class TestBreakerRecovery:
+    """A dead browser must not leave a brain benched forever."""
+
+    def test_an_open_circuit_recovers_when_the_browser_is_dead(
+        self, app_mod, monkeypatch
+    ):
+        mod = app_mod
+        b = asyncio.run(mod.get_browser("chatgpt"))
+        b.breaker.fail("cdp_dead", 300)
+        assert b.breaker.state == "open"
+
+        async def dead():
+            return True
+
+        monkeypatch.setattr(b, "browser_needs_relaunch", dead)
+
+        async def fake_ask(prompt, files=None, task_id=None):
+            return "back"
+
+        monkeypatch.setattr(b, "ask", fake_ask)
+
+        out = _body(asyncio.run(
+            mod.chat_completions(_FakeReq(_request_body()))))
+        assert "choices" in out, out
+        assert b.breaker.state == "closed"
+
+    def test_an_open_circuit_still_blocks_when_the_browser_is_fine(
+        self, app_mod, monkeypatch
+    ):
+        mod = app_mod
+        b = asyncio.run(mod.get_browser("chatgpt"))
+        b.breaker.fail("captcha", 300)
+
+        async def alive():
+            return False
+
+        monkeypatch.setattr(b, "browser_needs_relaunch", alive)
+
+        asked = []
+
+        async def fake_ask(prompt, files=None, task_id=None):
+            asked.append(1)
+            return "x"
+
+        monkeypatch.setattr(b, "ask", fake_ask)
+
+        out = _body(asyncio.run(
+            mod.chat_completions(_FakeReq(_request_body()))))
+        assert out.get("error", {}).get("code") == "circuit_open"
+        assert asked == []
 
 
 class _FakeReq:

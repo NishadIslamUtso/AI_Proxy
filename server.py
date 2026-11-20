@@ -456,11 +456,20 @@ async def brain_call(name, prompt, max_wait=None, files=None, task_id=None):
             print(f"[brain-proxy] skip paused escalation brain {brain}", flush=True)
             continue
         if not b.breaker.allow():
-            st = b.breaker.as_dict()
-            print(f"[brain-proxy] {brain} skipped: circuit {st['state']} "
-                  f"({st['last_code']})", flush=True)
-            last = BrainError("circuit_open", f"{brain} is benched", brain)
-            continue
+            # A dead browser is an infrastructure fault, not a brain fault.
+            # If we leave the breaker open, brain_call never reaches
+            # _connect, so the browser is never relaunched and the brain stays
+            # benched no matter how many cooldowns pass.
+            if await b.browser_needs_relaunch():
+                print(f"[brain-proxy] {brain}: circuit {b.breaker.as_dict()['state']} "
+                      f"but the browser is gone; resetting it", flush=True)
+                b.breaker.ok()
+            else:
+                st = b.breaker.as_dict()
+                print(f"[brain-proxy] {brain} skipped: circuit {st['state']} "
+                      f"({st['last_code']})", flush=True)
+                last = BrainError("circuit_open", f"{brain} is benched", brain)
+                continue
         t0 = time.time()
         try:
             reply = await asyncio.wait_for(
