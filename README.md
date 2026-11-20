@@ -102,7 +102,18 @@ by default).
   `recovery:` in `config.yaml`; they are appended to these defaults.
 - **Tab and session changes**: if the tab navigates to another thread on the
   same site mid-run, the proxy re-anchors on it and updates its thread map. If
-  it navigates off the site entirely, that is reported as `site_changed`.
+  it navigates off the site entirely, that is reported as `site_changed`. This
+  holds in chat mode as well as agent mode.
+- **You can intervene**: type in the composer and the proxy waits (up to three
+  escalating pauses) instead of failing the turn, and it never trips the circuit
+  breaker over it. It still refuses to overwrite text it did not write.
+- **Tools go where they belong**: a brain that runs in its own sandbox
+  (Arena's agent has a workspace and a shell) is not handed Hermes's whole tool
+  list. `advertise_tools` in `config.yaml` restricts a brain to the tools that
+  genuinely need your device; unset means "offer everything", which is right for
+  a brain with no workspace of its own. With nothing advertised the brain works
+  autonomously and Hermes only relays its answer - fewer tokens and less work
+  on your machine.
 - **No automation flags**: the browser is launched with an empty argument list.
   `--disable-blink-features=AutomationControlled` and `--no-sandbox` are bot
   fingerprints (Brave prints a warning banner for either), so `navigator.webdriver`

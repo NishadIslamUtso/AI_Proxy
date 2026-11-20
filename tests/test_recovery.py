@@ -292,5 +292,79 @@ class TestConfigExtension:
             assert cond["max"] >= 1, cond
 
 
+class TestUrlChange:
+    def test_same_site_thread_change_re_anchors(self, brain):
+        brain._run_url = "https://arena.ai/agent/aaa"
+        brain._run_key = "k"
+        brain.sessions["k"] = "https://arena.ai/agent/aaa"
+        brain._page = FakePage(url="https://arena.ai/agent/bbb")
+        assert _run(brain._note_url_change()) is True
+        assert brain.session_url == "https://arena.ai/agent/bbb"
+        assert brain.sessions["k"] == "https://arena.ai/agent/bbb"
+
+    def test_leaving_the_site_raises(self, brain):
+        from errors import BrainError
+
+        brain._run_url = "https://arena.ai/agent/aaa"
+        brain._page = FakePage(url="https://chatgpt.com/")
+        with pytest.raises(BrainError) as e:
+            _run(brain._note_url_change())
+        assert e.value.code == "site_changed"
+
+    def test_no_change_is_a_no_op(self, brain):
+        brain._run_url = "https://arena.ai/agent/aaa"
+        brain._page = FakePage(url="https://arena.ai/agent/aaa")
+        assert _run(brain._note_url_change()) is False
+
+    def test_unknown_url_is_a_no_op(self, brain):
+        brain._run_url = ""
+        brain._page = FakePage(url="https://arena.ai/agent/bbb")
+        assert _run(brain._note_url_change()) is False
+
+
+class TestHumanIntervention:
+    """Typing in the composer must not kill the turn."""
+
+    def _counting(self, brain, failures):
+        from errors import BrainError
+
+        calls = []
+
+        async def fake(prompt, files=None, task_id=None):
+            calls.append(1)
+            if len(calls) <= failures:
+                raise BrainError("user_tab_busy", "composer in use", "arena-agent")
+            return "ok"
+
+        brain._ask_once = fake
+        return calls
+
+    def test_busy_composer_is_waited_for(self, brain):
+        brain.busy_wait_base = 0
+        calls = self._counting(brain, failures=2)
+        assert _run(brain.ask("hi")) == "ok"
+        assert len(calls) == 3
+
+    def test_busy_composer_gives_up_after_three_waits(self, brain):
+        from errors import BrainError
+
+        brain.busy_wait_base = 0
+        self._counting(brain, failures=99)
+        with pytest.raises(BrainError) as e:
+            _run(brain.ask("hi"))
+        assert e.value.code == "user_tab_busy"
+
+    def test_busy_composer_does_not_trip_the_circuit_breaker(self, brain):
+        brain.busy_wait_base = 0
+        failed = []
+        brain.breaker = type("B", (), {
+            "fail": staticmethod(lambda *a: failed.append(a)),
+            "ok": staticmethod(lambda: None),
+        })()
+        self._counting(brain, failures=1)
+        assert _run(brain.ask("hi")) == "ok"
+        assert failed == []
+
+
 async def _async(value):
     return value

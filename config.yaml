@@ -165,6 +165,17 @@ brains:
     url: "https://arena.ai/agent"
     mode: agent
     agent_deadline: 7200
+    # Arena's agent has its own workspace and shell, so it does the work there
+    # instead of round-tripping every command through Hermes - which is the
+    # point: fewer tokens and less work on your machine.
+    #
+    # An empty list means "offer no tools at all": the brain acts autonomously
+    # in its own workspace and Hermes only relays its answer. List tool names
+    # to give it access back to your device, e.g.
+    #   advertise_tools: [terminal, read_file, write_file, search_files]
+    # Brains with no workspace of their own (chatgpt, deepseek, zai) should
+    # leave this unset so they are offered everything.
+    advertise_tools: []
     input_selectors:
       - ".tiptap.ProseMirror"
       - "div.tiptap[contenteditable='true']"

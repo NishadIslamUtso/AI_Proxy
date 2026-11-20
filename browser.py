@@ -157,6 +157,9 @@ class BrainBrowser:
         self._cond_seen = {}
         self._run_url = ""
         self._run_key = None
+        # Seconds to wait, per attempt, when the human is typing in the
+        # composer. Configurable so tests do not actually sleep.
+        self.busy_wait_base = 20.0
 
         self.user_data_dir = browser_cfg["user_data_dir"]
         self.executable_path = browser_cfg.get("executable_path") or ""
@@ -521,6 +524,39 @@ class BrainBrowser:
         base = self.url.split("?")[0].rstrip("/")
         return bool(url) and url.split("?")[0].rstrip("/").startswith(base)
 
+    async def _note_url_change(self, log=None):
+        """Re-anchor when the tab moves to another thread on the same site.
+
+        The user can change tabs or threads mid-run, and the site itself can
+        navigate. Following the new thread is what a person would do; only
+        leaving the site entirely is treated as a failure.
+
+        Returns True when the URL changed and we followed it.
+        """
+        try:
+            cur = self._page.url
+        except Exception:
+            return False
+        if not cur or not self._run_url or cur == self._run_url:
+            return False
+        if self._same_site(cur):
+            msg = f"URL_CHANGE {self._run_url} -> {cur}"
+            if log:
+                log(msg)
+            else:
+                print(f"[brain-proxy] {self.name}: {msg}", flush=True)
+            self.session_url = cur
+            self._run_url = cur
+            if self._run_key:
+                self.sessions[self._run_key] = cur
+            return True
+        msg = f"LEFT_SITE {cur}"
+        if log:
+            log(msg)
+        else:
+            print(f"[brain-proxy] {self.name}: {msg}", flush=True)
+        raise BrainError("site_changed", f"tab navigated away to {cur}", self.name)
+
     async def _detect_condition(self, before_text=""):
         """Return the first site condition the page shows, or None.
 
@@ -656,6 +692,15 @@ class BrainBrowser:
                 loc = self._page.get_by_text(label, exact=False)
                 if await loc.count() and await loc.first.is_visible():
                     await loc.first.click(timeout=3000)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _any_present(self, selectors):
+        for sel in selectors or []:
+            try:
+                if await self._page.locator(sel).count():
                     return True
             except Exception:
                 continue
@@ -1018,23 +1063,8 @@ class BrainBrowser:
                 raise BrainError("tab_dead", f"{type(e).__name__}: {e}", self.name)
 
             # A tab or session can change under us mid-run - the user picks a
-            # different thread, or the site navigates. Re-anchor rather than
-            # fail, as long as we are still on the same site.
-            try:
-                cur_url = self._page.url
-            except Exception:
-                cur_url = ""
-            if cur_url and self._run_url and cur_url != self._run_url:
-                if self._same_site(cur_url):
-                    log(f"URL_CHANGE {self._run_url} -> {cur_url}")
-                    self.session_url = cur_url
-                    self._run_url = cur_url
-                    if self._run_key:
-                        self.sessions[self._run_key] = cur_url
-                else:
-                    log(f"LEFT_SITE {cur_url}")
-                    raise BrainError("site_changed",
-                                     f"tab navigated away to {cur_url}", self.name)
+            # different thread, or the site navigates.
+            await self._note_url_change(log)
 
             # A recoverable site condition is acted on before the fatal list
             # below: "something went wrong" and friends are often just a turn
@@ -1149,18 +1179,30 @@ class BrainBrowser:
                     last = now
             return
         # Preferred: a "stop generating" control appears, then disappears.
-        for sel in self.done_when_gone:
-            try:
-                await self._page.wait_for_selector(sel, timeout=4000)
-                await self._page.wait_for_selector(sel, state="detached", timeout=240000)
-                return
-            except Exception:
-                continue
+        # Polled rather than awaited so a tab or thread change mid-turn is
+        # noticed too.
+        if self.done_when_gone:
+            stop_seen = False
+            waited = 0.0
+            deadline = time.time() + 240
+            while time.time() < deadline:
+                await asyncio.sleep(1.5)
+                waited += 1.5
+                await self._note_url_change()
+                if await self._any_present(self.done_when_gone):
+                    stop_seen = True
+                elif stop_seen:
+                    return
+                elif waited >= 12:
+                    # No stop control ever appeared; fall back to "text
+                    # stopped changing" below.
+                    break
         # Fallback: text stops changing for 4s (and has actually changed).
         last = before_text
         stable = 0
         for _ in range(240):
             await asyncio.sleep(1)
+            await self._note_url_change()
             now = await self._body_text()
             if now != before_text and now == last:
                 stable += 1
@@ -1444,15 +1486,26 @@ class BrainBrowser:
         if self.paused:
             raise BrainError("paused", f"{self.name} is paused by user", self.name)
         last = None
-        for attempt in range(2):
+        busy_waits = 0
+        for attempt in range(4):
             try:
                 reply = await self._ask_once(prompt, files, task_id)
                 self.breaker.ok()
                 return reply
             except BrainError as e:
                 last = e
+                if e.code == "user_tab_busy" and busy_waits < 3:
+                    # The human is typing in the composer. A person would wait
+                    # for them to finish rather than fail the turn - and would
+                    # never trip the circuit breaker over it.
+                    busy_waits += 1
+                    wait = self.busy_wait_base * busy_waits
+                    print(f"[brain-proxy] {self.name}: composer in use, waiting "
+                          f"{wait}s for the human ({busy_waits}/3)", flush=True)
+                    await asyncio.sleep(wait)
+                    continue
                 self.breaker.fail(e.code, COOLDOWN.get(e.code))
-                if e.code in TRANSIENT and attempt == 0:
+                if e.code in TRANSIENT and attempt < 3:
                     print(f"[brain-proxy] {self.name} [{e.code}] retrying: {e}", flush=True)
                     self.session_url = ""
                     self.ready = False
@@ -1464,7 +1517,7 @@ class BrainBrowser:
                 last = e
                 code = classify(e)
                 self.breaker.fail(code, COOLDOWN.get(code))
-                if code in TRANSIENT and attempt == 0:
+                if code in TRANSIENT and attempt < 3:
                     print(f"[brain-proxy] {self.name} [{code}] retrying: {e}", flush=True)
                     self.session_url = ""
                     self.ready = False

@@ -288,6 +288,34 @@ def extract_files(messages):
     return paths
 
 
+def tool_name(tool):
+    """The name of an OpenAI-shaped tool entry."""
+    if not isinstance(tool, dict):
+        return None
+    fn = tool.get("function")
+    if isinstance(fn, dict):
+        return fn.get("name")
+    return tool.get("name")
+
+
+def advertised_tools(brain_name, tools):
+    """The subset of tools this brain is offered.
+
+    A brain that runs in its own sandbox (arena-agent has a workspace and a
+    shell) should do that work itself rather than round-tripping every command
+    through Hermes, which costs the user tokens and device time. So a brain can
+    be restricted to the tools that genuinely need the user's device.
+
+    Unset means "offer everything" - right for a brain with no workspace of its
+    own, which can only act through Hermes.
+    """
+    allowed = (CFG["brains"].get(brain_name) or {}).get("advertise_tools")
+    if allowed is None:
+        return list(tools or [])
+    keep = set(allowed)
+    return [t for t in (tools or []) if tool_name(t) in keep]
+
+
 def tools_block(tools, max_chars=8000):
     if not tools:
         return ""
@@ -881,18 +909,19 @@ async def chat_completions(request: Request):
     stream = bool(body.get("stream"))
     limits = CFG.get("tool_truncation", {})
     files = extract_files(messages)
-    prompt = build_prompt(model_name, messages, body.get("tools"), limits)
+    tools = advertised_tools(model_name, body.get("tools"))
+    prompt = build_prompt(model_name, messages, tools, limits)
     tid = task_id(messages)
     print(f"[brain-proxy] -> {model_name} msgs={len(messages)} "
-          f"tools={len(body.get('tools') or [])} files={len(files)} "
+          f"tools={len(tools)} files={len(files)} "
           f"prompt_len={len(prompt)}", flush=True)
     print(f"[brain-proxy] prompt head: {prompt[:300]!r}", flush=True)
     try:
         (ROOT / "last-tools-block.txt").write_text(
-            tools_block(body.get("tools")), encoding="utf-8"
+            tools_block(tools), encoding="utf-8"
         )
         (ROOT / "last-request.json").write_text(
-            json.dumps({"tools": body.get("tools"), "messages": messages})[:200000],
+            json.dumps({"tools": tools, "messages": messages})[:200000],
             encoding="utf-8",
         )
     except Exception as e:
@@ -912,7 +941,7 @@ async def chat_completions(request: Request):
         if b.wants_rotation():
             await b.rotate(task_id=tid)
             STATE[model_name]["schema"] = ""
-            prompt2 = build_prompt(model_name, messages, body.get("tools"), limits)
+            prompt2 = build_prompt(model_name, messages, tools, limits)
             return await asyncio.wait_for(
                 b.ask(prompt2, files=files, task_id=tid), timeout=300)
         return await brain_call(model_name, prompt, files=files, task_id=tid)
@@ -956,7 +985,7 @@ async def chat_completions(request: Request):
 
                 try:
                     decision = await resolve_reply(
-                        model_name, served, reply, messages, body.get("tools"), tid
+                        model_name, served, reply, messages, tools, tid
                     )
                 except BrainError as e:
                     err = {"error": {"message": str(e), "type": "brain_proxy_error",
@@ -1039,7 +1068,7 @@ async def chat_completions(request: Request):
     # too and must be counted against the concurrency limit.
     try:
         decision = await resolve_reply(
-            model_name, served, reply, messages, body.get("tools"), tid
+            model_name, served, reply, messages, tools, tid
         )
     except BrainError as e:
         _ACTIVE.release()

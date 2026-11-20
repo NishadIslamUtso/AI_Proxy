@@ -220,6 +220,54 @@ class TestHelperFallback:
         assert out["error"]["code"] == "unparseable_brain_reply"
 
 
+class TestToolRouting:
+    """A brain that has its own workspace should not be handed every tool."""
+
+    def test_a_brain_with_no_setting_is_offered_everything(self, app_mod):
+        assert app_mod.advertised_tools("chatgpt", TOOLS) == TOOLS
+
+    def test_an_empty_list_offers_nothing(self, app_mod):
+        assert app_mod.advertised_tools("arena-agent", TOOLS) == []
+
+    def test_only_the_listed_tools_are_offered(self, app_mod, monkeypatch):
+        monkeypatch.setitem(app_mod.CFG["brains"]["arena-agent"],
+                            "advertise_tools", ["run_cmd"])
+        extra = {"type": "function", "function": {
+            "name": "read_file",
+            "parameters": {"type": "object", "properties": {}}}}
+        kept = app_mod.advertised_tools("arena-agent", TOOLS + [extra])
+        assert [t["function"]["name"] for t in kept] == ["run_cmd"]
+
+    def test_no_tools_block_reaches_a_tool_less_brain(self, app_mod, monkeypatch):
+        calls = _patch_brain(monkeypatch, app_mod, ["done"])
+        asyncio.run(app_mod.chat_completions(
+            _FakeReq(_request_body(model="arena-agent", tools=TOOLS))))
+        assert "get_weather" not in calls[0]
+
+    def test_prose_is_the_answer_when_no_tools_are_advertised(
+        self, app_mod, monkeypatch
+    ):
+        """With nothing advertised there is no protocol to violate."""
+        _patch_brain(monkeypatch, app_mod, ["I did the work in my workspace."])
+        out = _body(asyncio.run(
+            app_mod.chat_completions(_FakeReq(
+                _request_body(model="arena-agent", tools=TOOLS)))))
+        assert out["choices"][0]["finish_reason"] == "stop"
+        assert "workspace" in out["choices"][0]["message"]["content"]
+
+    def test_advertised_tools_are_still_validated(self, app_mod, monkeypatch):
+        """A brain cannot smuggle in a tool that was not advertised."""
+        monkeypatch.setitem(app_mod.CFG["brains"]["arena-agent"],
+                            "advertise_tools", ["run_cmd"])
+        _patch_brain(monkeypatch, app_mod, [
+            '{"tool": "delete_all_files", "args": {}}'
+        ])
+        out = _body(asyncio.run(
+            app_mod.chat_completions(_FakeReq(
+                _request_body(model="arena-agent", tools=TOOLS)))))
+        assert "error" in out
+
+
 class TestStreaming:
     def test_streaming_tool_call_frames(self, app_mod, monkeypatch):
         _patch_brain(monkeypatch, app_mod, [
