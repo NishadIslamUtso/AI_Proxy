@@ -13,3 +13,8 @@ shot*.png
 profile/
 profile.bak-*/
 logs/
+long.json
+mangle.json
+toolbody.json
+body.json
+sbody.json
