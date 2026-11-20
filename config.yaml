@@ -56,7 +56,7 @@ reanchor_every: 10
 escalation: []
 escalation_enabled: false
 max_concurrent: 4
-max_wait_seconds: 90
+max_wait_seconds: 120
 
 # The browser the proxy drives. Dedicated profile + dedicated CDP port so it
 # never fights Hermes's own browser (which is on 9222).

@@ -52,7 +52,8 @@ def classify(exc, page_title=""):
     if any(k in s for k in ("no reply", "empty reply", "no selector", "no input box",
                             "composer not found", "reply was empty")):
         return "no_reply"
-    if any(k in s for k in ("timeout", "timed out", "exceeded")):
+    if any(k in s for k in ("timeout", "timed out", "exceeded",
+                            "timeouterror")):
         return "no_reply"
     return "site_changed"
 
