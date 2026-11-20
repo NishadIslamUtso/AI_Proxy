@@ -2,35 +2,42 @@
 
 A local OpenAI-compatible endpoint backed by a **web chat AI**. Point Hermes's
 model at it and every model call is answered by a real web chat (ChatGPT,
-arena, ...) driven over CDP.
+Arena, DeepSeek, z.ai) driven in a **dedicated** browser profile.
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `server.py` | FastAPI app: `/v1/models`, `/v1/chat/completions`, `/health`, `/debug/dump` |
-| `browser.py` | Playwright driver — attaches to a dedicated browser over CDP |
+| `browser.py` | Patchright driver — launches a persistent context on a dedicated profile |
+| `brainjson.py` | parses the brain's reply into a tool call or a final answer |
 | `config.yaml` | brains, selectors, truncation, escalation, turn budget |
-| `start-browser.ps1` | launches the dedicated browser (CDP on 9223) |
-| `start-all.bat` | browser + server, used by the logon task |
+| `tests/` | deterministic tests (no browser, no account) |
+| `start-hermes-browser.ps1` | launches **Hermes's own** browser on CDP 9222 |
+| `start-all.bat` | server, used by the logon task |
 | `run-proxy.bat` | server only |
 
 ## Run
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File start-browser.ps1
 .venv\Scripts\python.exe server.py
 ```
 
-Then log into the target site **once** in the browser window that appears.
-The proxy drives the **owner's own Brave profile** (through the space-free
-junction `C:\hermes\brave-userdata`), so existing logins are reused.
-Hermes's own browser uses a separate profile on port 9222, so the two never
-fight.
+The proxy launches Brave itself on the **dedicated** profile
+`C:\hermes\brain-proxy\profile` (see `browser.user_data_dir` in
+`config.yaml`) and keeps it alive between turns, so the login survives.
+
+Log into the target site **once**, by hand, in the Brave window that opens.
+Nothing is typed for you and no credential is stored.
+
+Hermes's *own* browser is a separate program on a separate profile; launch it
+with `start-hermes-browser.ps1` if you need it on CDP 9222. The proxy does
+not use it and does not touch it.
 
 ## Test
 
 ```bash
+python -m pytest tests/ -q     # deterministic, no browser and no account
 curl http://127.0.0.1:8000/health
 curl http://127.0.0.1:8000/v1/models
 curl -X POST http://127.0.0.1:8000/v1/chat/completions \
@@ -46,11 +53,15 @@ In Hermes's model config:
 provider:  openai-compatible   (or "custom")
 base_url:  http://127.0.0.1:8000/v1
 api_key:   sk-unused
-model:     chatgpt             # chatgpt | arena-sonnet | arena-agent
+model:     chatgpt
 ```
 
-Switch brains by changing `model` and restarting Hermes, or set `default` in
-`config.yaml`. If one brain fails the proxy walks the `escalation` list.
+Available models: `chatgpt` (default), `arena-chat`, `arena-code`,
+`arena-gpt5`, `arena-agent`, `deepseek`, `zai`.
+
+Switch brains by changing `model`, or set `default` in `config.yaml`. If one
+brain fails the proxy walks the `escalation` list (`escalation_enabled: false`
+by default).
 
 ## How it keeps the brain smart
 
@@ -66,6 +77,36 @@ Switch brains by changing `model` and restarting Hermes, or set `default` in
 - **Escalation**: if a brain fails, it walks the `escalation` list.
 - **Reply marker**: a random token is appended to each prompt; the reply is
   everything after the last occurrence, so extraction survives DOM changes.
+- **Freshness check**: the response bubbles are snapshotted before the prompt
+  is sent, so a reply that is really the *previous* turn's answer is never
+  returned as this turn's.
+- **Never invent a result**: when tools are offered, the brain must answer
+  with a tool call or an explicit `{"final": ...}`. Prose that merely claims
+  a command result is refused, retried once, and then fails loudly - it is
+  never passed through as a finished answer.
+- **Self-recovery**: a free web chat fails in a few predictable ways, and each
+  has an obvious human remedy. The proxy recognises the message and applies it,
+  then waits, instead of handing the failure straight back:
+
+  | Site says | The proxy does |
+  |---|---|
+  | ran out of memory / context limit | resends the prompt |
+  | reached the tool-call limit for this turn | sends `Continue` |
+  | workspace over budget / files not saved | starts a fresh session |
+  | session expired / reload the page | reloads the tab |
+
+  Each condition is capped (`max`, default 2) so a genuinely broken thread
+  fails loudly rather than looping. A phrase only counts when it is *new* since
+  the prompt was sent, so an answer that merely discusses "the workspace is
+  over budget" is not mistaken for a fault. Add your own conditions under
+  `recovery:` in `config.yaml`; they are appended to these defaults.
+- **Tab and session changes**: if the tab navigates to another thread on the
+  same site mid-run, the proxy re-anchors on it and updates its thread map. If
+  it navigates off the site entirely, that is reported as `site_changed`.
+- **No automation flags**: the browser is launched with an empty argument list.
+  `--disable-blink-features=AutomationControlled` and `--no-sandbox` are bot
+  fingerprints (Brave prints a warning banner for either), so `navigator.webdriver`
+  is hidden with an init script instead, which leaves nothing in the command line.
 
 ## Debugging
 

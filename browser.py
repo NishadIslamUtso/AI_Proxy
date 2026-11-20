@@ -1,7 +1,9 @@
 """Browser driver for brain-proxy.
 
-Attaches to a dedicated Chromium-family browser over CDP and turns a web chat
-into something that behaves like a model endpoint. One instance per brain.
+Launches a dedicated Chromium-family browser on its own persistent profile and
+turns a web chat into something that behaves like a model endpoint. One
+instance per brain. The profile survives between turns, so the user logs in
+once and the login sticks.
 """
 import asyncio
 import hashlib
@@ -36,6 +38,63 @@ AGENT_ERROR = ("something went wrong", "please try again",
 RATE_LIMIT = ("daily usage limit", "reached your daily", "usage limit reached",
               "usage quota", "has been exhausted", "please try again in")
 
+# Site conditions the proxy recognises and acts on by itself.
+#
+# These are site-agnostic on purpose: an entry describes what a person would
+# do, not which site it is. A free web chat fails in a handful of predictable
+# ways - it runs out of memory, stops at a per-turn tool-call limit, fills its
+# workspace, expires its session - and each has an obvious human remedy. The
+# proxy applies the remedy and waits, and only gives up after `max` attempts.
+#
+# Phrases are matched case-insensitively against the page text, first match
+# wins, so the specific conditions must stay above the generic one.
+DEFAULT_RECOVERY = (
+    {
+        "id": "out_of_memory",
+        "phrases": ("ran out of memory", "out of memory",
+                    "context length exceeded", "context limit exceeded",
+                    "input is too long", "too many tokens"),
+        "action": "reprompt",
+        "max": 2,
+        "msg": "the site ran out of memory",
+    },
+    {
+        "id": "tool_call_limit",
+        "phrases": ("reached the tool-call limit", "tool call limit",
+                    "send a message to continue", "continue where it left off"),
+        "action": "continue",
+        "text": "Continue",
+        "max": 3,
+        "msg": "the site stopped at its per-turn tool-call limit",
+    },
+    {
+        "id": "workspace_full",
+        "phrases": ("workspace over budget", "files were not saved",
+                    "storage limit exceeded", "workspace is full",
+                    "disk quota exceeded"),
+        "action": "new_session",
+        "max": 2,
+        "msg": "the site workspace is over its limit",
+    },
+    {
+        "id": "session_expired",
+        "phrases": ("session expired", "page needs to be reloaded",
+                    "reload the page", "connection lost", "network error"),
+        "action": "refresh",
+        "max": 2,
+        "msg": "the site session needs a reload",
+    },
+    {
+        "id": "generic_error",
+        "phrases": ("something went wrong", "error occurred",
+                    "failed to generate"),
+        "action": "reprompt",
+        "max": 2,
+        "msg": "the site reported an error",
+    },
+)
+
+
 BRAIN_PREAMBLE = (
     "[BRAIN PROXY]\n"
     "You are the reasoning engine inside an agent framework. Your reply is used "
@@ -60,9 +119,16 @@ BRAIN_PREAMBLE_PLAIN = (
 
 _SHARED = {"pw": None, "ctx": None}
 
+# Playwright passes --disable-blink-features=AutomationControlled by default.
+# Brave prints a warning banner for it on every page and it is a well-known
+# automation fingerprint, so it is explicitly dropped from the defaults;
+# navigator.webdriver is hidden by the init script at launch instead, which
+# leaves nothing behind in the browser's own command line.
+IGNORE_DEFAULT_ARGS = ["--disable-blink-features=AutomationControlled"]
+
 
 class BrainBrowser:
-    def __init__(self, name, cfg, browser_cfg):
+    def __init__(self, name, cfg, browser_cfg, recovery=None):
         self.name = name
         self.url = cfg["url"]
         self.input_selectors = cfg.get("input_selectors") or [cfg.get("input_selector", "textarea")]
@@ -83,8 +149,18 @@ class BrainBrowser:
         self._idle_task = None
         self.file_input_selectors = cfg.get("file_input_selectors") or ["input[type='file']"]
 
+        # Site-condition recovery: the built-in defaults plus anything the
+        # config adds, so a new site can be taught without touching the code.
+        extra = recovery or cfg.get("recovery") or []
+        self.conditions = tuple(DEFAULT_RECOVERY) + tuple(extra)
+        self._cond_counts = {}
+        self._cond_seen = {}
+        self._run_url = ""
+        self._run_key = None
+
         self.user_data_dir = browser_cfg["user_data_dir"]
         self.executable_path = browser_cfg.get("executable_path") or ""
+        self.browser_cfg = browser_cfg or {}
         self._context = None
         self._pw = None
 
@@ -100,6 +176,14 @@ class BrainBrowser:
         self.turn_index = 0
         self.max_turns = 40
         self.reanchor_every = 10
+        # Snapshot of the response bubbles as they were *before* we sent, so
+        # _extract() can tell a new reply from the previous turn's answer.
+        self._pre_bubbles = None
+        # The last prompt we typed; used to recognise our own leftovers in the
+        # composer and to detect an answer that merely echoes our prompt.
+        self._last_typed = ""
+        # The marker token belonging to that last prompt.
+        self._prev_marker = ""
 
         try:
             import json as _j, pathlib as _p
@@ -115,6 +199,7 @@ class BrainBrowser:
                         self.response_selectors.insert(0, s)
                 self.learned_input_selectors = list(data.get("input", []))
                 self.learned_response_selectors = list(data.get("response", []))
+                self.sessions = dict(data.get("sessions") or {})
         except Exception:
             pass
 
@@ -182,11 +267,34 @@ class BrainBrowser:
         except Exception:
             return False
 
-    async def _connect(self):
+    @staticmethod
+    def _same_url(a, b):
+        if not a or not b:
+            return False
+        return a.rstrip("/").split("?")[0] == b.rstrip("/").split("?")[0]
+
+    async def _connect(self, url=None):
+        """Attach to this brain's page, optionally on a specific thread.
+
+        `url` is used to resume the conversation that belongs to the current
+        task, instead of whichever thread happened to be open last.
+        """
+        if url:
+            self.session_url = url
+
         if self.ready and self._page is not None:
             if await self._page_alive(self._page):
-                return
-            self.ready = False
+                if not url or self._same_url(self._page.url, url):
+                    return
+                try:
+                    await self._page.goto(url, wait_until="domcontentloaded")
+                    self.session_url = self._page.url
+                    await self._page.bring_to_front()
+                    return
+                except Exception:
+                    self.ready = False
+            else:
+                self.ready = False
 
         base = self.url.split("?")[0].rstrip("/")
         if self.session_url and not self.session_url.startswith(base):
@@ -200,13 +308,44 @@ class BrainBrowser:
                 self._pw = _SHARED["pw"]
             else:
                 self._pw = await async_playwright().start()
-                self._context = await self._pw.chromium.launch_persistent_context(
-                    user_data_dir=self.user_data_dir,
-                    headless=False,
-                    executable_path=self.executable_path or None,
-                    no_viewport=True,
-                    args=["--disable-blink-features=AutomationControlled"],
-                )
+                # Deliberately no --disable-blink-features=AutomationControlled.
+                # It is a well-known automation tell, and Brave prints a
+                # warning banner for it on every page - exactly the kind of
+                # fingerprint that gets a session flagged. navigator.webdriver
+                # is hidden by the init script below instead, which leaves
+                # nothing behind in the browser's own command line.
+                launch_args = []
+                # Playwright launches Chromium with --no-sandbox unless the
+                # sandbox is asked for explicitly. That flag shows up in the
+                # browser's own command line and in the sites' bot detection,
+                # so we ask for the sandbox and fall back if the machine
+                # cannot provide one.
+                sandbox = bool(self.browser_cfg.get("sandbox", True))
+                try:
+                    self._context = await self._pw.chromium.launch_persistent_context(
+                        user_data_dir=self.user_data_dir,
+                        headless=False,
+                        executable_path=self.executable_path or None,
+                        no_viewport=True,
+                        chromium_sandbox=sandbox,
+                        args=launch_args,
+                        ignore_default_args=IGNORE_DEFAULT_ARGS,
+                    )
+                except Exception as e:
+                    if not sandbox:
+                        raise
+                    print(f"[brain-proxy] {self.name}: sandbox unavailable "
+                          f"({type(e).__name__}: {str(e).splitlines()[0][:160]}), "
+                          f"retrying without it", flush=True)
+                    self._context = await self._pw.chromium.launch_persistent_context(
+                        user_data_dir=self.user_data_dir,
+                        headless=False,
+                        executable_path=self.executable_path or None,
+                        no_viewport=True,
+                        chromium_sandbox=False,
+                        args=launch_args,
+                        ignore_default_args=IGNORE_DEFAULT_ARGS,
+                    )
                 await self._context.add_init_script(
                     "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
                 )
@@ -217,12 +356,28 @@ class BrainBrowser:
         ctx = self._context
         if self.session_url:
             for p in ctx.pages:
-                if p.url == self.session_url and await self._page_alive(p):
+                if self._same_url(p.url, self.session_url) and await self._page_alive(p):
                     self._page = p
+                    self.session_url = p.url
                     await p.bring_to_front()
                     self.ready = True
                     print(f"[brain-proxy] {self.name} resumed {p.url}", flush=True)
                     return
+            # No tab is on that thread yet - move an existing tab there rather
+            # than opening yet another one.
+            for p in ctx.pages:
+                if p.url.startswith(base) and await self._page_alive(p):
+                    try:
+                        await p.goto(self.session_url, wait_until="domcontentloaded")
+                        self._page = p
+                        self.session_url = p.url
+                        await p.bring_to_front()
+                        self.ready = True
+                        print(f"[brain-proxy] {self.name} resumed {self.session_url}",
+                              flush=True)
+                        return
+                    except Exception:
+                        break
         for p in ctx.pages:
             if p.url.startswith(base) and await self._page_alive(p):
                 self._page = p
@@ -232,7 +387,7 @@ class BrainBrowser:
                 print(f"[brain-proxy] {self.name} attached {p.url}", flush=True)
                 return
         page = await ctx.new_page()
-        await page.goto(self.url, wait_until="domcontentloaded")
+        await page.goto(self.session_url or self.url, wait_until="domcontentloaded")
         try:
             await page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
@@ -334,9 +489,7 @@ class BrainBrowser:
             pass
         # arena's post-task feedback dialog steals the composer
         try:
-            if await self._page.locator("text=Was this task successful?").count():
-                await self._page.keyboard.press("Escape")
-                await asyncio.sleep(0.6)
+            await self._handle_arena_feedback()
         except Exception:
             pass
         # cookie / consent wall: click the plainly-safe buttons once, then
@@ -359,6 +512,150 @@ class BrainBrowser:
                 loc = self._page.locator(f"text={txt}")
                 if await loc.count():
                     await loc.first.click(timeout=2000)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _same_site(self, url):
+        base = self.url.split("?")[0].rstrip("/")
+        return bool(url) and url.split("?")[0].rstrip("/").startswith(base)
+
+    async def _detect_condition(self, before_text=""):
+        """Return the first site condition the page shows, or None.
+
+        A phrase only counts when it is *new* since `before_text` - the page as
+        it was before we sent. Without that test the brain's own answer would
+        trigger recoveries: an assistant explaining "the workspace is over
+        budget" is not the site reporting a fault.
+
+        A condition that was already on the page is retried only after a cool
+       -off, so a banner that survives one attempt gets one more chance but a
+        healthy turn is never re-triggered.
+        """
+        try:
+            body = await self._body_text()
+        except Exception:
+            return None
+        low = body.lower()
+        before_low = (before_text or "").lower()
+        for cond in self.conditions:
+            hit = next((p for p in (cond.get("phrases") or []) if p in low), None)
+            if not hit:
+                continue
+            if hit not in before_low:
+                return cond
+            last = self._cond_seen.get(cond.get("id"), 0.0)
+            if last and (time.time() - last) > 240:
+                return cond
+        return None
+
+    async def _recover_if_needed(self, before_text=""):
+        """Detect a site condition and apply its remedy. True if we acted."""
+        cond = await self._detect_condition(before_text)
+        if not cond:
+            return False
+        cid = cond.get("id") or cond.get("action") or "condition"
+        n = self._cond_counts.get(cid, 0)
+        limit = int(cond.get("max", 2))
+        if n >= limit:
+            raise BrainError(
+                "site_error",
+                f"{cid}: still failing after {n} recovery attempt(s)",
+                self.name,
+            )
+        self._cond_counts[cid] = n + 1
+        self._cond_seen[cid] = time.time()
+        print(f"[brain-proxy] {self.name}: {cid} - "
+              f"{cond.get('msg', 'recovering')} (attempt {n + 1}/{limit})",
+              flush=True)
+        acted = await self._recover(cond)
+        if acted:
+            await asyncio.sleep(3)
+        return acted
+
+    async def _recover(self, cond):
+        action = cond.get("action")
+        if action == "reprompt":
+            return await self._act_reprompt()
+        if action == "continue":
+            return await self._act_continue(cond.get("text", "Continue"))
+        if action == "refresh":
+            return await self._act_refresh()
+        if action == "new_session":
+            return await self._act_new_session()
+        if action == "click":
+            return await self._act_click(cond.get("buttons") or [])
+        return False
+
+    async def _clear_ours(self, el):
+        """Clear the composer, but only text we put there."""
+        try:
+            cur = (await self._composer_text(el)).strip()
+        except Exception:
+            return
+        if cur and not self._composer_text_is_ours(cur):
+            # The human is typing. Never destroy their input.
+            raise BrainError("user_tab_busy",
+                             f"{self.name}: composer has text we did not write",
+                             self.name)
+        if cur:
+            await el.click()
+            await self._page.keyboard.press("Control+A")
+            await self._page.keyboard.press("Delete")
+            await asyncio.sleep(0.3)
+
+    async def _act_reprompt(self):
+        """The site said 'try again': resend the prompt we already sent."""
+        el = await self._composer_ready()
+        if el is None:
+            return False
+        await self._clear_ours(el)
+        await self._type_and_send(el, self._last_typed)
+        return True
+
+    async def _act_continue(self, text):
+        """The site stopped mid-turn: nudge it the way a person would."""
+        el = await self._composer_ready()
+        if el is None:
+            return False
+        await self._clear_ours(el)
+        await self._type_and_send(el, text)
+        return True
+
+    async def _act_refresh(self):
+        """Reload the tab and re-check for walls."""
+        try:
+            await self._page.reload(wait_until="domcontentloaded")
+        except Exception:
+            return False
+        await asyncio.sleep(3)
+        try:
+            await self._guard_ui()
+        except BrainError:
+            raise
+        except Exception:
+            pass
+        return True
+
+    async def _act_new_session(self):
+        """The thread is unusable (usually full): start a fresh one."""
+        await self.new_thread()
+        try:
+            self.session_url = self._page.url
+        except Exception:
+            pass
+        if self._run_key:
+            self.sessions.pop(self._run_key, None)
+        self._save_learned()
+        return True
+
+    async def _act_click(self, labels):
+        for label in labels:
+            try:
+                loc = self._page.get_by_text(label, exact=False)
+                if await loc.count() and await loc.first.is_visible():
+                    await loc.first.click(timeout=3000)
                     return True
             except Exception:
                 continue
@@ -418,6 +715,46 @@ class BrainBrowser:
                 return el
         return None
 
+    async def _handle_arena_feedback(self):
+        """Answer Arena's post-task "Was this task successful?" dialog.
+
+        The correct answer is **Keep working**: it closes the dialog and lets
+        the agent carry on. "No" offers an undo that can roll back work that
+        has already been done, so it is never clicked. If "Keep working" is
+        not on the page we fall back to Escape, which dismisses the dialog
+        without picking an option at all.
+        """
+        try:
+            if not await self._page.locator(
+                "text=Was this task successful?"
+            ).count():
+                return False
+        except Exception:
+            return False
+
+        for sel in ("text=Keep working",
+                    "button:has-text('Keep working')",
+                    "[role='button']:has-text('Keep working')"):
+            try:
+                loc = self._page.locator(sel)
+                if await loc.count():
+                    await loc.first.click(timeout=4000)
+                    await asyncio.sleep(0.8)
+                    print(f"[brain-proxy] {self.name}: arena feedback -> "
+                          f"Keep working", flush=True)
+                    return True
+            except Exception:
+                continue
+
+        try:
+            await self._page.keyboard.press("Escape")
+            await asyncio.sleep(0.6)
+            print(f"[brain-proxy] {self.name}: arena feedback dismissed "
+                  f"(no Keep working button found)", flush=True)
+        except Exception:
+            pass
+        return False
+
     async def _dismiss_safe_dialogs(self):
         safe = (
             "button:has-text('Accept all')",
@@ -441,6 +778,50 @@ class BrainBrowser:
             return (await el.input_value()) or ""
         return (await el.inner_text()) or ""
 
+    def _composer_text_is_ours(self, cur):
+        """Is the text currently in the composer text that we put there?
+
+        Our own prompts are recognisable by the marker token we append and by
+        the distinctive preamble. Anything else was typed by the human, and
+        must never be deleted.
+
+        The test has to be tight in both directions. Too tight and the proxy
+        refuses to run because it mistakes its own leftover for user input;
+        too loose and a two-word message from the human ("ok") gets wiped.
+        """
+        cur = (cur or "").strip()
+        if not cur:
+            return True
+
+        prev = (getattr(self, "_last_typed", "") or "").strip()
+        prev_marker = getattr(self, "_prev_marker", "") or ""
+
+        # Our previous prompt, unchanged.
+        if prev and cur == prev:
+            return True
+        # Our previous prompt, cut short. If a send was interrupted (killed
+        # process, dropped connection) the composer is left holding a prefix
+        # of what we typed, and it is ours by construction. A prefix match is
+        # strong evidence - the human's message would have to coincidentally
+        # be a leading slice of our prompt.
+        if prev and cur and len(cur) < len(prev) and prev.startswith(cur):
+            return True
+        # Our previous prompt, cut short by the site. Only long text counts:
+        # a short match is far more likely to be a word the human typed that
+        # happens to appear somewhere in our prompt.
+        if prev and len(cur) >= 40 and cur in prev:
+            return True
+        # The marker token is the only recognisable part of a later-turn
+        # prompt, because the preamble is only sent on the first turn.
+        if prev_marker and prev_marker in cur:
+            return True
+        # The preamble.
+        if cur.startswith("[BRAIN PROXY]"):
+            return True
+        if "reasoning engine inside an agent framework" in cur.lower():
+            return True
+        return False
+
     async def _human_type(self, el, prompt):
         """Type like a person, but bounded.
 
@@ -455,24 +836,29 @@ class BrainBrowser:
             await el.fill(prompt)
             return
 
-        typed_budget = 120 if len(prompt) > 400 else len(prompt)
-        head, rest = prompt[:typed_budget], prompt[typed_budget:]
-
-        for i, ch in enumerate(head):
-            await self._page.keyboard.insert_text(ch)
-            d = _random.gauss(0.065, 0.025)
-            d = max(0.025, min(0.15, d))
-            if ch in " .,;:!?\n":
-                d += _random.uniform(0.05, 0.25)
-            if i > 0 and i % _random.randint(40, 120) == 0:
-                d += _random.uniform(0.4, 1.8)
-            await asyncio.sleep(d)
-
-        while rest:
-            n = _random.randint(400, 900)
-            chunk, rest = rest[:n], rest[n:]
-            await self._page.keyboard.insert_text(chunk)
-            await asyncio.sleep(_random.uniform(0.25, 0.9))
+        # These sites submit on Enter, so a newline in the prompt must go in
+        # as Shift+Enter - a bare newline can end the turn early.
+        parts = prompt.split("\n")
+        for pi, part in enumerate(parts):
+            if pi:
+                await self._page.keyboard.press("Shift+Enter")
+                await asyncio.sleep(_random.uniform(0.15, 0.5))
+            if not part:
+                continue
+            # small chunks, not one character at a time: per-character
+            # insert_text races the editor's own re-render and drops or
+            # reorders keystrokes, which is what produced the typos
+            step = _random.randint(6, 18)
+            for i in range(0, len(part), step):
+                chunk = part[i:i + step]
+                await self._page.keyboard.insert_text(chunk)
+                d = _random.gauss(0.07, 0.03)
+                d = max(0.03, min(0.16, d))
+                if chunk[-1] in " .,;:!?\"'":
+                    d += _random.uniform(0.05, 0.22)
+                await asyncio.sleep(d)
+            if _random.random() < 0.12:
+                await asyncio.sleep(_random.uniform(0.3, 1.1))
 
     async def _type_and_send(self, el, prompt):
         _gap = time.time() - self.last_send
@@ -631,10 +1017,65 @@ class BrainBrowser:
                 log(f"DEAD body_eval {type(e).__name__}: {e}")
                 raise BrainError("tab_dead", f"{type(e).__name__}: {e}", self.name)
 
+            # A tab or session can change under us mid-run - the user picks a
+            # different thread, or the site navigates. Re-anchor rather than
+            # fail, as long as we are still on the same site.
+            try:
+                cur_url = self._page.url
+            except Exception:
+                cur_url = ""
+            if cur_url and self._run_url and cur_url != self._run_url:
+                if self._same_site(cur_url):
+                    log(f"URL_CHANGE {self._run_url} -> {cur_url}")
+                    self.session_url = cur_url
+                    self._run_url = cur_url
+                    if self._run_key:
+                        self.sessions[self._run_key] = cur_url
+                else:
+                    log(f"LEFT_SITE {cur_url}")
+                    raise BrainError("site_changed",
+                                     f"tab navigated away to {cur_url}", self.name)
+
+            # A recoverable site condition is acted on before the fatal list
+            # below: "something went wrong" and friends are often just a turn
+            # that needs resending.
+            if check_n % 2 == 0:
+                try:
+                    acted = await self._recover_if_needed(before_text)
+                except BrainError:
+                    raise
+                except Exception:
+                    acted = False
+                if acted:
+                    log(f"RECOVERED check={check_n}")
+                    # The remedy changed the page; restart the state machine
+                    # so its progress is measured from here, not from before.
+                    try:
+                        before_text = await self._body_text()
+                    except Exception:
+                        pass
+                    last_text = before_text
+                    last_change = time.time()
+                    no_stop_since = None if has_stop else time.time()
+                    state = "starting"
+                    continue
+
             for phrase in AGENT_ERROR:
                 if phrase in body.lower():
                     log(f"FAILED phrase={phrase!r}")
                     raise BrainError("site_error", phrase, self.name)
+
+            # Arena can pop its feedback dialog mid-run and steal the
+            # composer. Answer it with "Keep working" so the agent carries
+            # on. Deliberately infrequent - polling the page aggressively
+            # is what triggers human-verification checks.
+            if check_n % 6 == 0:
+                try:
+                    if await self._handle_arena_feedback():
+                        log(f"DIALOG arena feedback answered (keep working) "
+                            f"check={check_n}")
+                except Exception:
+                    pass
 
             stop = await self._first(self.done_when_gone, timeout=500) if has_stop else None
             changed = body != last_text
@@ -729,39 +1170,61 @@ class BrainBrowser:
                 stable = 0
                 last = now
 
-    async def _extract(self, before_text):
-        if self.mode == "agent":
-            for sel in self.response_selectors:
-                try:
-                    loc = self._page.locator(sel)
-                    n = await loc.count()
-                    for i in range(n - 1, -1, -1):
-                        text = (await loc.nth(i).inner_text()).strip()
-                        if text and not self._is_status(text):
-                            return self._clean(text)
-                except Exception:
-                    continue
-            return ""
-        after = await self._body_text()
-        # Preferred: an explicit response bubble. More precise than "everything
-        # after the marker", which also sweeps up vote buttons and page chrome.
+    async def _response_snapshot(self):
+        """Capture the current assistant response bubbles.
+
+        Used to prove that a reply we extract actually appeared *after* we
+        sent the prompt, rather than being the previous turn's answer still
+        sitting on the page.
+        """
+        texts = []
         for sel in self.response_selectors:
             try:
                 loc = self._page.locator(sel)
                 n = await loc.count()
-                if n:
-                    text = (await loc.nth(n - 1).inner_text()).strip()
-                    if text:
-                        return self._clean(text)
+                if n > len(texts):
+                    for i in range(n):
+                        try:
+                            t = (await loc.nth(i).inner_text()).strip()
+                        except Exception:
+                            t = ""
+                        texts.append(t)
+                    break
             except Exception:
                 continue
+        return texts
+
+    async def _extract(self, before_text):
+        pre = getattr(self, "_pre_bubbles", None)
+        current = await self._response_snapshot()
+
+        # Prefer an explicit response bubble, but only one that is provably
+        # new. Returning the last bubble blindly meant a slow brain could be
+        # answered with the previous turn's text.
+        if current:
+            fresh = []
+            if pre is None:
+                fresh = current
+            else:
+                if len(current) > len(pre):
+                    fresh = current[len(pre):]
+                elif current[-1] != pre[-1]:
+                    # The last bubble changed in place (streaming / agent mode).
+                    fresh = [current[-1]]
+            for text in reversed(fresh):
+                if text and not self._is_status(text):
+                    return self._clean(text)
+
+        after = await self._body_text()
         # Fallback: everything after the marker we appended to the prompt.
+        # The marker is unique per send, so this is freshness-safe too.
         marker = getattr(self, "_marker", None)
         if marker:
             idx = after.rfind(marker)
             if idx >= 0:
                 tail = after[idx + len(marker):]
-                return self._clean(tail)
+                if tail.strip():
+                    return self._clean(tail)
         if after.startswith(before_text):
             return self._clean(after[len(before_text):].strip())
         return self._clean(after.strip())
@@ -773,6 +1236,77 @@ class BrainBrowser:
     )
 
     _SAID = re.compile(r"(?:ChatGPT|Gemini|DeepSeek|Arena)\s+said:\s*", re.IGNORECASE)
+
+    _ECHO_PHRASES = (
+        "same task",
+        "the task is the same",
+        "the task is unchanged",
+        "task unchanged",
+        "no change to the task",
+        "continuing with the same task",
+        "understood",
+        "got it",
+        "acknowledged",
+    )
+
+    # Deliberately narrow: only an explicit restatement of the JSON contract
+    # counts. Anything looser (an answer that merely starts with "I need to
+    # reply to...") gets mistaken for an echo and is silently deleted.
+    _ECHO_FORMAT_RE = re.compile(
+        r"^reply\s+with\s+exactly\s+one\s+json\b", re.IGNORECASE
+    )
+
+    _STOPWORDS = frozenset(
+        "the a an and or to of in is it you your that this with for on as be "
+        "i we my our are was were will would can could should do does did not "
+        "but if then than so such have has had".split()
+    )
+
+    @staticmethod
+    def _norm_ws(s):
+        return re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+    def _is_prompt_echo(self, para):
+        """True when a paragraph is the brain echoing our own prompt back.
+
+        The old heuristic looked for words like "we need" or "the user wants"
+        at the start of the first paragraph and deleted it. That silently ate
+        the opening of legitimate answers ("We need to fix the parser...").
+
+        Now the paragraph is only removed when it is provably an echo:
+          - it quotes text we actually sent, or
+          - nearly all of its content words came from what we sent, or
+          - it is an unambiguous "acknowledged" phrase, or
+          - it explicitly restates the one-JSON-object contract.
+        """
+        p = self._norm_ws(para)
+        if not p:
+            return False
+
+        sent = self._norm_ws(getattr(self, "_last_typed", "") or "")
+        if sent:
+            # Trailing punctuation often differs (our prompt ends with a
+            # colon, the brain's echo with a full stop), so compare without it.
+            p_cmp = p.rstrip(".!?;:, ")
+            s_cmp = sent.rstrip(".!?;:, ")
+            if len(p_cmp) >= 24 and p_cmp in s_cmp:
+                return True
+
+            # Word-level check: nearly every content word came from our own
+            # prompt. The word count floor keeps ordinary answers out.
+            pw = [w for w in re.findall(r"[a-z0-9]+", p) if w not in self._STOPWORDS]
+            if len(pw) >= 8:
+                sw = set(re.findall(r"[a-z0-9]+", sent))
+                if sum(1 for w in pw if w in sw) / len(pw) >= 0.9:
+                    return True
+
+        if p.strip(".!?,") in self._ECHO_PHRASES:
+            return True
+
+        if len(p) <= 200 and self._ECHO_FORMAT_RE.match(p):
+            return True
+
+        return False
 
     def _clean(self, text):
         """Strip inter-bubble chrome and trailing site boilerplate."""
@@ -801,19 +1335,8 @@ class BrainBrowser:
             text = re.sub(pat, "", text, flags=re.I | re.M).strip()
 
         paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-        if len(paras) >= 2:
-            opener = paras[0].lower()
-            strip_it = bool(re.match(
-                r"^(we need|the user (wants|asked|is)|the task (is|changed|now|was|has)"
-                r"|the request is|same task|i should|i need|okay,? |alright,? |let me)",
-                opener))
-            if not strip_it and len(paras[0]) < 160:
-                # "Same task: reply exactly X" / "Task: answer with Y"
-                strip_it = bool(
-                    re.match(r"^(the )?(task|request|goal|instruction|same task)", opener)
-                    and re.search(r"(reply|answer|exactly|instead|now)", opener))
-            if strip_it:
-                paras = paras[1:]
+        if len(paras) >= 2 and self._is_prompt_echo(paras[0]):
+            paras = paras[1:]
             text = "\n\n".join(paras)
 
         cut = len(text)
@@ -885,6 +1408,9 @@ class BrainBrowser:
                 "session_url": self.session_url,
                 "input": self.learned_input_selectors,
                 "response": self.learned_response_selectors,
+                # The per-task -> thread map used to live only in memory, so
+                # every restart forgot which thread belonged to which task.
+                "sessions": self.sessions,
             }
             out.write_text(_j.dumps(data, indent=2), encoding="utf-8")
         except Exception:
@@ -908,14 +1434,19 @@ class BrainBrowser:
     def _task_key(self, prompt):
         return hashlib.sha256(prompt[:400].encode("utf-8", "ignore")).hexdigest()[:16]
 
-    async def ask(self, prompt, files=None):
-        """Send one prompt to the web chat and return its reply."""
+    async def ask(self, prompt, files=None, task_id=None):
+        """Send one prompt to the web chat and return its reply.
+
+        `task_id` identifies the *task*, not the turn. It is what lets the
+        brain be resumed on the thread that belongs to this task instead of
+        whichever thread was open last.
+        """
         if self.paused:
             raise BrainError("paused", f"{self.name} is paused by user", self.name)
         last = None
         for attempt in range(2):
             try:
-                reply = await self._ask_once(prompt, files)
+                reply = await self._ask_once(prompt, files, task_id)
                 self.breaker.ok()
                 return reply
             except BrainError as e:
@@ -943,7 +1474,7 @@ class BrainBrowser:
                 raise BrainError(code, f"{type(e).__name__}: {e}", self.name)
         raise BrainError(classify(last) if last else "no_reply", str(last), self.name)
 
-    async def _ask_once(self, prompt, files=None):
+    async def _ask_once(self, prompt, files=None, task_id=None):
         async with self._lock:
             try:
                 await self._preflight()
@@ -958,18 +1489,26 @@ class BrainBrowser:
 
             # per-task thread: same task keeps its conversation, a new task
             # gets its own instead of inheriting someone else's.
-            key = self._task_key(prompt)
-            if not self.session_url:
-                self.session_url = self.sessions.get(key, "")
-                if self.session_url:
-                    try:
-                        await self._connect()
-                        await self._guard_ui()
-                        before = await self._body_text()
-                    except BrainError:
-                        raise
-                    except Exception as e:  # noqa: BLE001
-                        raise BrainError(classify(e), str(e), self.name)
+            #
+            # The lookup used to run only while self.session_url was empty.
+            # Since session_url is set after every successful turn, the
+            # mapping was never consulted again and every new task silently
+            # continued in the previous task's thread.
+            key = task_id or self._task_key(prompt)
+            wanted = self.sessions.get(key, "")
+            if wanted and wanted != self.session_url:
+                try:
+                    await self._connect(url=wanted)
+                    await self._guard_ui()
+                    before = await self._body_text()
+                except BrainError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    raise BrainError(classify(e), str(e), self.name)
+
+            # Snapshot the response bubbles so we can later prove that the
+            # reply we extract is new and not the previous turn's answer.
+            self._pre_bubbles = await self._response_snapshot()
 
             self._marker = f"BR{uuid.uuid4().hex[:8].upper()}"
             note = ""
@@ -982,26 +1521,26 @@ class BrainBrowser:
                 raise BrainError("no_reply", f"no composer on {self._page.url}", self.name)
             cur = (await self._composer_text(el)).strip()
             if cur:
-                prev = getattr(self, "_last_typed", "") or ""
-                ours = bool(prev and (cur in prev or prev.startswith(cur[:80])))
-                if not ours:
-                    # our prompts carry a marker and a distinctive preamble
-                    ours = bool(
-                        re.search(r"\bBR[0-9A-F]{8}\b", cur)
-                        or "reasoning engine inside an agent framework" in cur.lower()
-                        or cur.startswith("[BRAIN PROXY]")
-                    )
-                if not ours and len(cur) >= 20:
-                    # long enough to be a person mid-message - leave it alone
+                if not self._composer_text_is_ours(cur):
+                    # Anything in the composer that we did not put there is the
+                    # human typing into the dedicated browser. The old code
+                    # only objected to text of 20+ characters, so a short
+                    # message ("stop", "hi") was silently deleted and
+                    # overwritten. Never destroy input we did not write.
                     raise BrainError("user_tab_busy",
-                                     f"{self.name}: composer already has text", self.name)
-                # ours, or a stray keystroke: clear and continue
+                                     f"{self.name}: composer already has text "
+                                     f"({len(cur)} chars) - refusing to overwrite",
+                                     self.name)
+                # our own leftover - clear it and continue
                 await el.click()
                 await self._page.keyboard.press("Control+A")
                 await self._page.keyboard.press("Delete")
                 await asyncio.sleep(0.3)
             try:
                 self._last_typed = prompt + note + "\n\n" + self._marker
+                self._prev_marker = self._marker
+                self._run_url = self._page.url
+                self._run_key = key
                 await self._type_and_send(el, self._last_typed)
                 if files:
                     await self._attach(files)
@@ -1019,6 +1558,15 @@ class BrainBrowser:
                     raise BrainError("auth_wall", f"login needed: {self._page.url}",
                                      self.name)
 
+            # A condition can be on the page the moment the turn starts (the
+            # previous turn ended on an error banner). Act before waiting.
+            try:
+                await self._recover_if_needed(before)
+            except BrainError:
+                raise
+            except Exception:
+                pass
+
             try:
                 if self.mode == "agent":
                     await self._wait_agent(before)
@@ -1028,6 +1576,18 @@ class BrainBrowser:
                 raise
             except Exception as e:  # noqa: BLE001
                 raise BrainError(classify(e), f"{type(e).__name__}: {e}", self.name)
+
+            # ... or it can appear only once the reply has been rendered.
+            try:
+                if await self._recover_if_needed(before):
+                    if self.mode == "agent":
+                        await self._wait_agent(before)
+                    else:
+                        await self._wait_reply(before)
+            except BrainError:
+                raise
+            except Exception:
+                pass
 
             reply = await self._extract(before)
             self.session_url = self._page.url
@@ -1065,11 +1625,16 @@ class BrainBrowser:
             self.turn_index += 1
             return reply
 
-    async def rotate(self):
-        """Ask for a summary, start a fresh chat, seed it, reset the counter."""
+    async def rotate(self, task_id=None):
+        """Ask for a summary, start a fresh chat, seed it, reset the counter.
+
+        The task id is carried through so the rotation does not leave stray
+        entries in the per-task thread map.
+        """
         summary = await self.ask(
             "Summarize this task so far in under 500 words: the original goal, "
-            "decisions made, current state, and what remains. No preamble."
+            "decisions made, current state, and what remains. No preamble.",
+            task_id=task_id,
         )
         await self.new_thread()
         self.turn_index = 0
@@ -1078,7 +1643,7 @@ class BrainBrowser:
             + summary
             + "\n\nContinue the same task from where it left off."
         )
-        return await self.ask(seed)
+        return await self.ask(seed, task_id=task_id)
 
     def wants_rotation(self):
         return self.turn_index >= self.max_turns

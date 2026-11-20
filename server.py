@@ -1,16 +1,20 @@
 """brain-proxy: a local OpenAI-compatible endpoint backed by a web chat AI.
 
 Hermes points its model at http://127.0.0.1:8000/v1 and every "model" call is
-answered by a real web chat (ChatGPT, arena, ...) driven over CDP.
+answered by a real web chat (ChatGPT, Arena, DeepSeek, z.ai) driven in a
+dedicated browser profile.
+
+The contract with the brain is strict on purpose: when the caller offers
+tools, the brain must answer with a tool call or an explicit final answer.
+Prose that merely claims a command result is refused rather than passed
+through, because a made-up tool result is worse than a loud failure.
 """
 import asyncio
 import base64
 import hashlib
 import json
-import os
 import re
 import socket
-import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -20,6 +24,8 @@ import yaml
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from brainjson import parse_brain_reply
+from brainjson import extract_json_objects as brainjson_objects
 from browser import BRAIN_PREAMBLE, BRAIN_PREAMBLE_PLAIN, BrainBrowser
 from errors import (
     COOLDOWN,
@@ -61,9 +67,7 @@ def record(brain, code, ms, attempt=0, ok=False):
         s["codes"][code] = s["codes"].get(code, 0) + 1
 
 import os as _os
-import json as _json_helper
 import subprocess as _subprocess
-import tempfile as _tempfile
 
 HELPER_RECURSION_GUARD = "HERMES_PROXY_GUARD"
 
@@ -141,15 +145,16 @@ async def call_helper(messages, tools=None, kind="chat"):
     return out
 
 
-def reply_looks_like_tool_json(reply):
-    s = (reply or "").strip()
-    if not s.startswith("{"):
+def reply_looks_like_tool_json(reply, tools=None):
+    """True when the reply carries a usable tool call or an explicit final.
+
+    The old version required the reply to *start* with "{", so a brain that
+    wrote "Sure! here you go: {...}" was judged unusable and the good reply
+    was thrown away.
+    """
+    if not (reply or "").strip():
         return False
-    try:
-        obj = json.loads(s)
-    except Exception:
-        return False
-    return isinstance(obj, dict) and ("tool" in obj or "final" in obj)
+    return parse_brain_reply(reply, tools).kind in ("tool", "final")
 
 
 ROLE_MARKERS = (
@@ -229,6 +234,18 @@ def format_conversation(messages, limits):
     )
 
 
+def task_id(messages):
+    """A stable id for the *task* behind a request.
+
+    The prompt we send changes on every turn (it carries the conversation),
+    so hashing the prompt produced a different key each time and the
+    per-task -> thread map never matched. The original task does not change,
+    so that is what identifies the task.
+    """
+    first = first_user_message(messages)
+    return hashlib.sha256(first[:400].encode("utf-8", "ignore")).hexdigest()[:16]
+
+
 def first_user_message(messages):
     for m in messages:
         if m.get("role") == "user":
@@ -295,43 +312,30 @@ def tools_block(tools, max_chars=8000):
 
 
 def extract_json(reply):
-    reply = (reply or "").strip()
-    try:
-        return json.loads(reply)
-    except Exception:
-        pass
-    depth = 0
-    start = None
-    for i, ch in enumerate(reply):
-        if ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0 and start is not None:
-                try:
-                    return json.loads(reply[start:i + 1])
-                except Exception:
-                    start = None
-    return None
+    """Best-effort: find a JSON object in a brain reply.
+
+    Kept for callers that just want "the object the brain sent". The
+    tool/final decision is made by parse_tool_reply below, which also
+    validates the result against the offered tools.
+    """
+    objs = brainjson_objects(reply)
+    return objs[0] if objs else None
 
 
-def parse_tool_reply(reply):
-    obj = extract_json(reply)
-    if isinstance(obj, dict) and "tool" in obj:
-        return {
-            "tool_calls": [{
-                "id": f"call_{uuid.uuid4().hex[:8]}",
-                "type": "function",
-                "function": {
-                    "name": str(obj.get("tool")),
-                    "arguments": json.dumps(obj.get("args", {})),
-                },
-            }]
-        }
-    final = obj.get("final") if isinstance(obj, dict) and "final" in obj else None
-    return {"final": final if final is not None else reply}
+def parse_tool_reply(reply, tools=None):
+    """Turn a brain reply into an OpenAI-shaped tool call or a final answer.
+
+    Unlike the old implementation this never invents a result: a reply that
+    cannot be parsed into a tool call or an explicit {"final": ...} comes
+    back with an "error" key instead of being passed through as a finished
+    answer.
+    """
+    parsed = parse_brain_reply(reply, tools)
+    if parsed.kind == "tool":
+        return {"tool_calls": parsed.as_tool_call()}
+    if parsed.kind == "final":
+        return {"final": parsed.final}
+    return {"final": None, "error": parsed.reason, "raw": parsed.raw}
 
 
 async def get_browser(name):
@@ -339,7 +343,8 @@ async def get_browser(name):
         if name not in BROWSERS:
             if name not in CFG["brains"]:
                 raise KeyError(name)
-            b = BrainBrowser(name, CFG["brains"][name], CFG["browser"])
+            b = BrainBrowser(name, CFG["brains"][name], CFG["browser"],
+                             CFG.get("recovery"))
             b.max_turns = CFG.get("max_turns_per_thread", 40)
             b.reanchor_every = CFG.get("reanchor_every", 10)
             BROWSERS[name] = b
@@ -400,7 +405,7 @@ def build_prompt(name, messages, tools, limits):
     return prompt
 
 
-async def brain_call(name, prompt, max_wait=None, files=None):
+async def brain_call(name, prompt, max_wait=None, files=None, task_id=None):
     """Call a brain, escalating through the configured fallback list."""
     if max_wait is None:
         max_wait = int(CFG.get("max_wait_seconds", 180))
@@ -430,7 +435,8 @@ async def brain_call(name, prompt, max_wait=None, files=None):
             continue
         t0 = time.time()
         try:
-            reply = await asyncio.wait_for(b.ask(prompt, files=files), timeout=max_wait)
+            reply = await asyncio.wait_for(
+                b.ask(prompt, files=files, task_id=task_id), timeout=max_wait)
             record(brain, "ok", (time.time() - t0) * 1000, ok=True)
             return reply, brain
         except BrainError as e:
@@ -445,6 +451,86 @@ async def brain_call(name, prompt, max_wait=None, files=None):
     if last is not None:
         raise last
     raise BrainError("proxy_escalation_failed", f"tried {order}")
+
+
+async def resolve_reply(brain, served, reply, messages, tools, tid=None):
+    """Turn a raw brain reply into a decision we can trust.
+
+    Returns a BrainReply with kind "tool" or "final".
+
+    When the request offered tools, the brain MUST answer with either a
+    tool call or an explicit {"final": ...}. Prose is not an acceptable
+    substitute: a brain that says "the command returned 42" without a tool
+    call is claiming a result that no tool produced. Handing that back as a
+    finished answer is exactly the failure this whole project exists to
+    avoid, so instead we:
+
+      1. ask the brain once more, with a stricter instruction,
+      2. fall back to the helper CLI if one is configured,
+      3. and only then fail loudly with a diagnostic.
+
+    With no tools offered, plain prose IS the answer and is returned as-is.
+    """
+    parsed = parse_brain_reply(sanitize(reply), tools)
+
+    if parsed.kind in ("tool", "final"):
+        return parsed
+    if not tools:
+        # No tools were offered, so there is no protocol to violate.
+        parsed.kind = "final"
+        parsed.final = reply
+        return parsed
+
+    reason = parsed.reason or "no_json_object"
+    print(f"[brain-proxy] reply not parseable ({reason}); retrying", flush=True)
+
+    # 1. one stricter retry against the same brain
+    retry_prompt = (
+        "Your previous reply could not be parsed. Reply with exactly one "
+        "JSON object and nothing else - no prose, no markdown fence, no "
+        "explanation before or after:\n"
+        '{"tool": "<tool_name>", "args": {...}}\n'
+        'or\n'
+        '{"final": "<your answer>"}\n'
+        "If a tool failed, still return the tool call so the framework can "
+        "run it and show you the real output. Never state a command result "
+        "you did not receive from a tool.\n"
+        "Task to continue: " + content_to_text(messages[-1].get("content", ""))
+    )
+    try:
+        _r = await asyncio.wait_for(
+            brain_call(served or brain, retry_prompt, task_id=tid),
+            timeout=60,
+        )
+        retry_reply = _r[0] if isinstance(_r, tuple) else _r
+    except Exception as e:  # noqa: BLE001
+        print(f"[brain-proxy] retry failed: {type(e).__name__}: {e}", flush=True)
+        retry_reply = None
+
+    if retry_reply:
+        parsed = parse_brain_reply(sanitize(retry_reply), tools)
+        if parsed.kind in ("tool", "final"):
+            return parsed
+        reason = parsed.reason or reason
+
+    # 2. helper CLI fallback
+    print("[brain-proxy] tool JSON still missing, delegating to helper",
+          flush=True)
+    _h = await call_helper(messages, tools=tools, kind="tool_json")
+    if _h is not None:
+        parsed = parse_brain_reply(sanitize(_h), tools)
+        if parsed.kind in ("tool", "final"):
+            return parsed
+        reason = parsed.reason or reason
+
+    # 3. fail loudly - never invent a result
+    raise BrainError(
+        "unparseable_brain_reply",
+        f"brain '{brain}' produced a reply that is neither a tool call nor a "
+        f"final answer (reason={reason}); refusing to pass prose through as "
+        f"a completed result",
+        brain,
+    )
 
 
 @app.get("/health")
@@ -796,6 +882,7 @@ async def chat_completions(request: Request):
     limits = CFG.get("tool_truncation", {})
     files = extract_files(messages)
     prompt = build_prompt(model_name, messages, body.get("tools"), limits)
+    tid = task_id(messages)
     print(f"[brain-proxy] -> {model_name} msgs={len(messages)} "
           f"tools={len(body.get('tools') or [])} files={len(files)} "
           f"prompt_len={len(prompt)}", flush=True)
@@ -823,87 +910,105 @@ async def chat_completions(request: Request):
     async def run_brain():
         b = await get_browser(model_name)
         if b.wants_rotation():
-            await b.rotate()
+            await b.rotate(task_id=tid)
             STATE[model_name]["schema"] = ""
             prompt2 = build_prompt(model_name, messages, body.get("tools"), limits)
-            return await asyncio.wait_for(b.ask(prompt2, files=files), timeout=300)
-        return await brain_call(model_name, prompt, files=files)
+            return await asyncio.wait_for(
+                b.ask(prompt2, files=files, task_id=tid), timeout=300)
+        return await brain_call(model_name, prompt, files=files, task_id=tid)
 
     if stream:
         async def gen():
-            head = {
-                "id": response_id, "object": "chat.completion.chunk",
-                "created": created, "model": model_name,
-                "choices": [{"index": 0,
-                             "delta": {"role": "assistant", "content": ""},
-                             "finish_reason": None}],
-            }
-            yield f"data: {json.dumps(head)}\n\n"
-
-            task = asyncio.create_task(run_brain())
-            while not task.done():
-                try:
-                    await asyncio.wait_for(asyncio.shield(task), timeout=15)
-                    break
-                except asyncio.TimeoutError:
-                    yield ": keep-alive\n\n"
-
+            # The semaphore was acquired before we got here. Streaming used to
+            # return without releasing it, so after MAX_CONCURRENT streamed
+            # requests the proxy refused every further call with "proxy busy".
             try:
-                reply, served = task.result()
-            except BrainError as e:
-                err = {"error": {"message": str(e), "type": "brain_proxy_error",
-                                 "code": e.code}}
-                yield f"data: {json.dumps(err)}\n\n"
-                yield "data: [DONE]\n\n"
-                return
-            except Exception as e:
-                err = {"error": {"message": str(e), "type": "proxy_error"}}
-                yield f"data: {json.dumps(err)}\n\n"
-                yield "data: [DONE]\n\n"
-                return
-
-            parsed = parse_tool_reply(sanitize(reply))
-            if isinstance(parsed, dict) and "tool_calls" in parsed:
-                for tc in parsed["tool_calls"]:
-                    chunk = {
-                        "id": response_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model_name,
-                        "choices": [{"index": 0, "delta": {"tool_calls": [{
-                            "index": 0, "id": tc["id"], "type": "function",
-                            "function": {"name": tc["function"]["name"],
-                                         "arguments": tc["function"]["arguments"]},
-                        }]}, "finish_reason": None}],
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-                tail = {
-                    "id": response_id, "object": "chat.completion.chunk",
-                    "created": created, "model": model_name,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
-                }
-                yield f"data: {json.dumps(tail)}\n\n"
-                yield "data: [DONE]\n\n"
-                return
-
-            text = parsed.get("final", reply) if isinstance(parsed, dict) else reply
-            if not isinstance(text, str):
-                text = reply
-            for i in range(0, len(text), 200):
-                chunk = {
+                head = {
                     "id": response_id, "object": "chat.completion.chunk",
                     "created": created, "model": model_name,
                     "choices": [{"index": 0,
-                                 "delta": {"content": text[i:i+200]},
+                                 "delta": {"role": "assistant", "content": ""},
                                  "finish_reason": None}],
                 }
-                yield f"data: {json.dumps(chunk)}\n\n"
-                await asyncio.sleep(0.02)
-            tail = {
-                "id": response_id, "object": "chat.completion.chunk",
-                "created": created, "model": model_name,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }
-            yield f"data: {json.dumps(tail)}\n\n"
-            yield "data: [DONE]\n\n"
+                yield f"data: {json.dumps(head)}\n\n"
+
+                task = asyncio.create_task(run_brain())
+                while not task.done():
+                    try:
+                        await asyncio.wait_for(asyncio.shield(task), timeout=15)
+                        break
+                    except asyncio.TimeoutError:
+                        yield ": keep-alive\n\n"
+
+                try:
+                    reply, served = task.result()
+                except BrainError as e:
+                    err = {"error": {"message": str(e), "type": "brain_proxy_error",
+                                     "code": e.code}}
+                    yield f"data: {json.dumps(err)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                except Exception as e:
+                    err = {"error": {"message": str(e), "type": "proxy_error"}}
+                    yield f"data: {json.dumps(err)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                try:
+                    decision = await resolve_reply(
+                        model_name, served, reply, messages, body.get("tools"), tid
+                    )
+                except BrainError as e:
+                    err = {"error": {"message": str(e), "type": "brain_proxy_error",
+                                     "code": e.code}}
+                    yield f"data: {json.dumps(err)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                if decision.kind == "tool":
+                    for tc in decision.as_tool_call():
+                        chunk = {
+                            "id": response_id, "object": "chat.completion.chunk",
+                            "created": created, "model": model_name,
+                            "choices": [{"index": 0, "delta": {"tool_calls": [{
+                                "index": 0, "id": tc["id"], "type": "function",
+                                "function": {"name": tc["function"]["name"],
+                                             "arguments": tc["function"]["arguments"]},
+                            }]}, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                    tail = {
+                        "id": response_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model_name,
+                        "choices": [{"index": 0, "delta": {},
+                                     "finish_reason": "tool_calls"}],
+                    }
+                    yield f"data: {json.dumps(tail)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                text = decision.final
+                if not isinstance(text, str):
+                    text = reply
+                for i in range(0, len(text), 200):
+                    chunk = {
+                        "id": response_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model_name,
+                        "choices": [{"index": 0,
+                                     "delta": {"content": text[i:i+200]},
+                                     "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                    await asyncio.sleep(0.02)
+                tail = {
+                    "id": response_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model_name,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+                yield f"data: {json.dumps(tail)}\n\n"
+                yield "data: [DONE]\n\n"
+            finally:
+                _ACTIVE.release()
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -929,47 +1034,30 @@ async def chat_completions(request: Request):
         code = classify(e)
         return JSONResponse(status_code=502,
                             content=as_openai_error(code, str(e)))
+
+    # The slot is held across the retry, because the retry is browser work
+    # too and must be counted against the concurrency limit.
+    try:
+        decision = await resolve_reply(
+            model_name, served, reply, messages, body.get("tools"), tid
+        )
+    except BrainError as e:
+        _ACTIVE.release()
+        return JSONResponse(status_code=502,
+                            content=as_openai_error(e.code, str(e)))
     _ACTIVE.release()
 
-    if body.get("tools") and not reply_looks_like_tool_json(reply):
-        retry_prompt = (
-            "Your previous reply was prose. You must reply with "
-            "exactly one JSON object on its own: "
-            '{"tool": "<name>", "args": {...}} or {"final": "..."}. '
-            "Do not add any other text before or after. Retry for: "
-            + content_to_text(messages[-1].get("content", ""))
-        )
-        try:
-            _r = await asyncio.wait_for(
-                brain_call(served or model_name, retry_prompt),
-                timeout=60,
-            )
-            reply = _r[0] if isinstance(_r, tuple) else _r
-        except Exception:
-            pass
-        if not reply_looks_like_tool_json(reply):
-            print("[brain-proxy] tool JSON still missing, delegating to helper",
-                  flush=True)
-            _h = await call_helper(
-                messages,
-                tools=body.get("tools"),
-                kind="tool_json",
-            )
-            if _h is not None:
-                reply = _h
-
-    parsed = parse_tool_reply(sanitize(reply))
     usage = {
         "prompt_tokens": max(1, len(prompt) // 4),
         "completion_tokens": max(1, len(reply) // 4),
         "total_tokens": (len(prompt) + len(reply)) // 4,
     }
-    if "tool_calls" in parsed:
+    if decision.kind == "tool":
         message = {"role": "assistant", "content": None,
-                   "tool_calls": parsed["tool_calls"]}
+                   "tool_calls": decision.as_tool_call()}
         finish = "tool_calls"
     else:
-        message = {"role": "assistant", "content": parsed["final"],
+        message = {"role": "assistant", "content": decision.final,
                    "reasoning_content": None}
         finish = "stop"
     return _completion(response_id, served, message, finish, usage)

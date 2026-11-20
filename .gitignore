@@ -9,6 +9,8 @@ last-request.json
 last-tools-block.txt
 *.lnk
 telemetry.jsonl
+# per-brain session URLs and learned selectors - machine local, never commit
+learned.json
 shot*.png
 profile/
 profile.bak-*/

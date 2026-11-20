@@ -1,0 +1,344 @@
+"""End-to-end tests for the request handler with a mocked brain.
+
+These drive the real FastAPI app but replace the browser layer, so they
+exercise the actual prompt building, reply parsing, retry policy, error
+mapping and SSE framing - without touching a real web account.
+
+The behaviour under test is the one that matters most for this project:
+the proxy must never hand Hermes a result that no tool produced.
+"""
+
+import asyncio
+import json
+import sys
+import types
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+
+@pytest.fixture()
+def app_mod(monkeypatch):
+    """Import server.py with the browser module stubbed out."""
+    stub = types.ModuleType("browser")
+    stub.BRAIN_PREAMBLE = "[BRAIN PROXY]\n"
+    stub.BRAIN_PREAMBLE_PLAIN = "[BRAIN PROXY]\n"
+
+    class BrainBrowser:
+        def __init__(self, *a, **k):
+            self.paused = False
+            self.max_turns = 40
+            self.reanchor_every = 10
+            self.breaker = types.SimpleNamespace(allow=lambda: True,
+                                                  as_dict=lambda: {})
+
+        def wants_rotation(self):
+            return False
+
+    stub.BrainBrowser = BrainBrowser
+    monkeypatch.setitem(sys.modules, "browser", stub)
+
+    import server
+
+    # call_helper spawns the real helper CLI (a 90s subprocess). The suite is
+    # supposed to be deterministic and offline, so stub it out; the helper
+    # fallback itself gets its own test below.
+    async def _no_helper(messages, tools=None, kind="chat"):
+        return None
+
+    monkeypatch.setattr(server, "call_helper", _no_helper)
+
+    return server
+
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_cmd",
+            "description": "Run a shell command",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    }
+]
+
+
+def _patch_brain(monkeypatch, mod, replies):
+    """Make brain_call return `replies` in order (last one repeats)."""
+    calls = []
+
+    async def fake_brain_call(name, prompt, max_wait=None, files=None,
+                              task_id=None):
+        calls.append(prompt)
+        r = replies[min(len(calls) - 1, len(replies) - 1)]
+        if isinstance(r, Exception):
+            raise r
+        return r, name
+
+    monkeypatch.setattr(mod, "brain_call", fake_brain_call)
+    return calls
+
+
+def _request_body(**over):
+    body = {
+        "model": "chatgpt",
+        "messages": [{"role": "user", "content": "list the files please"}],
+    }
+    body.update(over)
+    return body
+
+
+class TestToolCallFidelity:
+    def test_clean_tool_call_becomes_a_tool_call(self, app_mod, monkeypatch):
+        _patch_brain(monkeypatch, app_mod, [
+            '{"tool": "run_cmd", "args": {"command": "ls -la"}}'
+        ])
+        out = _body(asyncio.run(
+            app_mod.chat_completions(_FakeReq(_request_body(tools=TOOLS)))))
+        assert out["choices"][0]["finish_reason"] == "tool_calls"
+        tc = out["choices"][0]["message"]["tool_calls"][0]
+        assert tc["function"]["name"] == "run_cmd"
+        assert json.loads(tc["function"]["arguments"]) == {"command": "ls -la"}
+
+    def test_mangled_markdown_still_becomes_a_tool_call(self, app_mod, monkeypatch):
+        """This is the bug that made the brain look like it was hallucinating."""
+        _patch_brain(monkeypatch, app_mod, [
+            'Sure!\n```json\n{"tool": "run_cmd", "args": {"command": "ls -la"}}\n```\n'
+            'Hope that helps!'
+        ])
+        out = _body(asyncio.run(
+            app_mod.chat_completions(_FakeReq(_request_body(tools=TOOLS)))))
+        assert out["choices"][0]["finish_reason"] == "tool_calls"
+        tc = out["choices"][0]["message"]["tool_calls"][0]
+        assert json.loads(tc["function"]["arguments"]) == {"command": "ls -la"}
+
+    def test_smart_quotes_still_become_a_tool_call(self, app_mod, monkeypatch):
+        _patch_brain(monkeypatch, app_mod, [
+            '{“tool”: “run_cmd”, “args”: {“command”: “ls -la”}}'
+        ])
+        out = _body(asyncio.run(
+            app_mod.chat_completions(_FakeReq(_request_body(tools=TOOLS)))))
+        assert out["choices"][0]["finish_reason"] == "tool_calls"
+
+
+class TestNoInventedResults:
+    """The brain must never fake a tool result in prose."""
+
+    def test_prose_claiming_a_result_is_not_returned_as_an_answer(
+        self, app_mod, monkeypatch
+    ):
+        # The brain claims a command returned data - but never issued a tool call.
+        _patch_brain(monkeypatch, app_mod, [
+            "The command returned three files: a.txt, b.txt and c.txt."
+        ])
+        out = _body(asyncio.run(
+            app_mod.chat_completions(_FakeReq(_request_body(tools=TOOLS)))))
+        # It must NOT come back as a normal completion.
+        assert "choices" not in out, "prose was passed through as a finished answer"
+        assert out["error"]["code"] == "unparseable_brain_reply"
+
+    def test_prose_falls_back_to_retrying_the_brain(self, app_mod, monkeypatch):
+        calls = _patch_brain(monkeypatch, app_mod, [
+            "I ran it and got three files.",
+            '{"tool": "run_cmd", "args": {"command": "ls"}}',
+        ])
+        out = _body(asyncio.run(
+            app_mod.chat_completions(_FakeReq(_request_body(tools=TOOLS)))))
+        assert len(calls) == 2, "the brain should have been asked a second time"
+        assert out["choices"][0]["finish_reason"] == "tool_calls"
+
+    def test_unparseable_after_retry_is_a_hard_error(self, app_mod, monkeypatch):
+        calls = _patch_brain(monkeypatch, app_mod, ["not json", "still not json"])
+        out = _body(asyncio.run(
+            app_mod.chat_completions(_FakeReq(_request_body(tools=TOOLS)))))
+        assert len(calls) == 2
+        assert "error" in out
+        assert out["error"]["code"] == "unparseable_brain_reply"
+
+    def test_hallucinated_tool_name_is_rejected(self, app_mod, monkeypatch):
+        """A brain asking for a tool that does not exist must not be obeyed."""
+        _patch_brain(monkeypatch, app_mod, [
+            '{"tool": "delete_all_files", "args": {}}'
+        ])
+        out = _body(asyncio.run(
+            app_mod.chat_completions(_FakeReq(_request_body(tools=TOOLS)))))
+        assert "error" in out
+        assert out["error"]["code"] == "unparseable_brain_reply"
+
+    def test_prose_is_fine_when_no_tools_are_offered(self, app_mod, monkeypatch):
+        """Plain chat: prose is the answer, not a protocol violation."""
+        _patch_brain(monkeypatch, app_mod, ["Hello! How can I help you today?"])
+        out = _body(asyncio.run(
+            app_mod.chat_completions(_FakeReq(_request_body()))))
+        assert out["choices"][0]["finish_reason"] == "stop"
+        assert "How can I help" in out["choices"][0]["message"]["content"]
+
+
+class TestHelperFallback:
+    def test_helper_supplies_the_tool_call_when_the_brain_writes_prose(
+        self, app_mod, monkeypatch
+    ):
+        """The helper is the last resort before failing loudly."""
+        _patch_brain(monkeypatch, app_mod, [
+            "I ran it and got three files.",
+            "I already told you the result.",
+        ])
+
+        async def _helper(messages, tools=None, kind="chat"):
+            assert kind == "tool_json"
+            return '{"tool": "run_cmd", "args": {"command": "ls"}}'
+
+        monkeypatch.setattr(app_mod, "call_helper", _helper)
+
+        out = _body(asyncio.run(
+            app_mod.chat_completions(_FakeReq(_request_body(tools=TOOLS)))))
+        assert out["choices"][0]["finish_reason"] == "tool_calls"
+        tc = out["choices"][0]["message"]["tool_calls"][0]
+        assert json.loads(tc["function"]["arguments"]) == {"command": "ls"}
+
+    def test_helper_output_is_never_passed_through_unvalidated(
+        self, app_mod, monkeypatch
+    ):
+        """A helper that answers in prose must not become a finished answer."""
+        _patch_brain(monkeypatch, app_mod, ["not json", "still not json"])
+
+        async def _helper(messages, tools=None, kind="chat"):
+            return "sure, here is the answer you wanted"
+
+        monkeypatch.setattr(app_mod, "call_helper", _helper)
+
+        out = _body(asyncio.run(
+            app_mod.chat_completions(_FakeReq(_request_body(tools=TOOLS)))))
+        assert "choices" not in out
+        assert out["error"]["code"] == "unparseable_brain_reply"
+
+
+class TestStreaming:
+    def test_streaming_tool_call_frames(self, app_mod, monkeypatch):
+        _patch_brain(monkeypatch, app_mod, [
+            '{"tool": "run_cmd", "args": {"command": "ls"}}'
+        ])
+        resp = asyncio.run(app_mod.chat_completions(
+            _FakeReq(_request_body(tools=TOOLS, stream=True))))
+        chunks = _drain(resp)
+        assert chunks, "expected at least one SSE chunk"
+        payloads = _sse_payloads(chunks)
+        assert payloads[-1] == "[DONE]", "the stream must terminate with [DONE]"
+        tool_chunks = [p for p in payloads
+                       if isinstance(p, dict) and "choices" in p
+                       and p["choices"][0]["delta"].get("tool_calls")]
+        assert tool_chunks, "expected a tool_calls delta in the stream"
+        args = tool_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+        assert json.loads(args) == {"command": "ls"}
+
+    def test_streaming_releases_the_concurrency_semaphore(self, app_mod, monkeypatch):
+        """Regression: streaming used to leak a semaphore slot every call."""
+        _patch_brain(monkeypatch, app_mod, ['{"final": "done"}'])
+        mod = app_mod
+        before = mod._ACTIVE._value
+        for _ in range(mod.MAX_CONCURRENT + 2):
+            resp = asyncio.run(mod.chat_completions(
+                _FakeReq(_request_body(stream=True))))
+            _drain(resp)
+        assert mod._ACTIVE._value == before, \
+            "streaming leaked a concurrency slot"
+
+    def test_streaming_error_is_reported_in_the_stream(self, app_mod, monkeypatch):
+        _patch_brain(monkeypatch, app_mod, ["not json at all"])
+        resp = asyncio.run(app_mod.chat_completions(
+            _FakeReq(_request_body(tools=TOOLS, stream=True))))
+        chunks = _drain(resp)
+        joined = "".join(chunks)
+        assert "unparseable_brain_reply" in joined
+
+
+class TestConcurrencyAccounting:
+    """The concurrency slot must be released on every path."""
+
+    def test_non_streaming_releases_the_slot(self, app_mod, monkeypatch):
+        _patch_brain(monkeypatch, app_mod, ['{"final": "done"}'])
+        mod = app_mod
+        before = mod._ACTIVE._value
+        for _ in range(mod.MAX_CONCURRENT + 2):
+            out = _body(asyncio.run(
+                mod.chat_completions(_FakeReq(_request_body()))))
+            assert "choices" in out
+        assert mod._ACTIVE._value == before
+
+    def test_failed_request_releases_the_slot(self, app_mod, monkeypatch):
+        _patch_brain(monkeypatch, app_mod, ["not json", "still not json"])
+        mod = app_mod
+        before = mod._ACTIVE._value
+        out = _body(asyncio.run(
+            mod.chat_completions(_FakeReq(_request_body(tools=TOOLS)))))
+        assert out["error"]["code"] == "unparseable_brain_reply"
+        assert mod._ACTIVE._value == before
+
+    def test_brain_failure_releases_the_slot(self, app_mod, monkeypatch):
+        async def boom(name, prompt, max_wait=None, files=None, task_id=None):
+            raise RuntimeError("browser exploded")
+
+        monkeypatch.setattr(app_mod, "brain_call", boom)
+        mod = app_mod
+        before = mod._ACTIVE._value
+        out = _body(asyncio.run(mod.chat_completions(_FakeReq(_request_body()))))
+        assert "error" in out
+        assert mod._ACTIVE._value == before
+
+
+class _FakeReq:
+    """Minimal stand-in for fastapi Request."""
+
+    def __init__(self, body):
+        self._body = body
+
+    async def json(self):
+        return self._body
+
+
+def _drain(resp):
+    """Collect the body of a StreamingResponse."""
+    async def _read():
+        out = []
+        async for chunk in resp.body_iterator:
+            out.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
+        return out
+
+    return asyncio.run(_read())
+
+
+def _body(resp):
+    """Return the parsed JSON body of a JSONResponse (or a plain dict)."""
+    if isinstance(resp, dict):
+        return resp
+    raw = resp.body
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"error": {"message": raw, "code": "unparseable_response"}}
+
+
+def _sse_payloads(chunks):
+    """Parse SSE chunks into a list of dicts, keeping [DONE] as a marker."""
+    out = []
+    for c in chunks:
+        if not c.startswith("data: "):
+            continue
+        raw = c[len("data: "):].strip()
+        if raw == "[DONE]":
+            out.append("[DONE]")
+            continue
+        try:
+            out.append(json.loads(raw))
+        except Exception:
+            out.append({"raw": raw})
+    return out

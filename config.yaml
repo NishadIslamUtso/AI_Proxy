@@ -58,11 +58,31 @@ escalation_enabled: false
 max_concurrent: 4
 max_wait_seconds: 120
 
+# Site conditions the proxy resolves by itself, without bothering you.
+# Each entry: id, phrases (matched against the page text), action, max tries.
+# Actions: reprompt | continue | refresh | new_session | click
+#
+# The built-in defaults already cover the four failures these sites actually
+# produce: running out of memory, stopping at the per-turn tool-call limit,
+# filling the workspace, and an expired session. Add entries here for other
+# sites - they are appended to the defaults, not a replacement.
+#
+# recovery:
+#   - id: weird_site_quota
+#     phrases: ["you are out of credits", "upgrade to continue"]
+#     action: reprompt
+#     max: 2
+recovery: []
+
 # The browser the proxy drives. Dedicated profile + dedicated CDP port so it
 # never fights Hermes's own browser (which is on 9222).
 browser:
   user_data_dir: "C:/hermes/brain-proxy/profile"
   executable_path: "C:/Users/Nishad Islam Utso/AppData/Local/BraveSoftware/Brave-Browser/Application/brave.exe"
+  # Ask Chromium for its sandbox. Patchright/Playwright otherwise start it
+  # with --no-sandbox, which shows up in the browser's own command line and
+  # to the target sites. Set to false only if the machine cannot sandbox.
+  sandbox: true
 
 # Per-tool truncation. Tool output longer than this is head+tail trimmed.
 tool_truncation:

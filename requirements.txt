@@ -2,3 +2,4 @@ fastapi
 uvicorn
 patchright
 pyyaml
+pytest

@@ -1,0 +1,9 @@
+{
+  "_comment": "Copy to learned.json to seed. Contains per-brain session URLs and learned selectors; never commit the real file.",
+  "chatgpt": {
+    "session_url": "",
+    "input": [],
+    "response": [],
+    "sessions": {}
+  }
+}

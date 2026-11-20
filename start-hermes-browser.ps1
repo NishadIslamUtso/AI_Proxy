@@ -18,6 +18,18 @@ Start-Process -FilePath $brave -ArgumentList @(
   "--user-data-dir=$dir",
   "--no-first-run",
   "--no-default-browser-check",
+  "--remote-debugging-port=9222",
   "about:blank"
 )
-Write-Output "hermes browser launched on 9222"
+
+# Give the debugging port a moment to come up, then verify it is really
+# listening - the old version of this script printed "launched on 9222"
+# without ever asking Brave to open that port.
+Start-Sleep -Seconds 3
+try {
+  $r = Invoke-WebRequest -Uri "http://127.0.0.1:9222/json/version" -UseBasicParsing -TimeoutSec 5
+  Write-Output "hermes browser launched on 9222"
+  Write-Output $r.Content
+} catch {
+  Write-Output "hermes browser started, but port 9222 is NOT answering: $($_.Exception.Message)"
+}

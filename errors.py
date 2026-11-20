@@ -18,7 +18,14 @@ TRANSIENT = {"upstream_offline", "cdp_dead", "tab_dead", "send_failed",
 
 # Retrying will not help; the human has to do something or the brain must be skipped.
 FAIL_FAST = {"auth_wall", "captcha", "rate_limited", "site_changed", "user_tab_busy",
-             "consent_wall", "paused"}
+             "consent_wall", "paused", "browser_missing"}
+
+# The brain answered, but not with a tool call or a final answer. This is
+# deliberately NOT a fail-fast: the brain may just be flaky, and benning it
+# for ten minutes over one bad reply would be worse than the bad reply.
+# It is also not transient: resolve_reply() already retried once and tried
+# the helper fallback before raising this.
+UNPARSEABLE = {"unparseable_brain_reply"}
 
 # How long a brain stays benched when this code trips the breaker.
 COOLDOWN = {
@@ -36,6 +43,10 @@ def classify(exc, page_title=""):
 
     if "just a moment" in t or "cloudflare" in t or "verify you are human" in t:
         return "captcha"
+    if any(k in s for k in ("executable doesn't exist", "executable does not exist",
+                            "playwright install", "patchright install",
+                            "no such file or directory")):
+        return "browser_missing"
     if any(k in s for k in ("err_internet_disconnected", "err_name_not_resolved",
                             "err_connection", "net::err", "connection refused",
                             "getaddrinfo", "name or service not known")):
