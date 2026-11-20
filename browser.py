@@ -494,26 +494,89 @@ class BrainBrowser:
         return ""
 
     async def _wait_agent(self, before_text):
-        deadline = time.time() + getattr(self, "agent_deadline", 900)
-        last_text, stable = before_text, 0
+        deadline = time.time() + getattr(self, "agent_deadline", 7200)
+        log_dir = Path("C:/hermes/brain-proxy/logs")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{self.name}-{int(time.time())}.log"
+
+        def log(msg):
+            try:
+                with log_file.open("a", encoding="utf-8") as f:
+                    f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+            except Exception:
+                pass
+
+        deadline_s = int(getattr(self, "agent_deadline", 7200))
+        has_stop = bool(self.done_when_gone)
+        log(f"START deadline={deadline_s}s has_stop={has_stop} url={self._page.url}")
+
+        state = "starting"
+        last_text = before_text
+        last_change = time.time()
+        no_stop_since = None if has_stop else time.time()
+        check_n = 0
+
         while time.time() < deadline:
-            await asyncio.sleep(2)
-            err = await self._find_text(AGENT_ERROR)
-            if err:
-                raise BrainError("site_error", err, self.name)
-            stop = await self._first(self.done_when_gone, timeout=500)
-            now = await self._body_text()
-            if now == last_text:
-                stable += 1
+            await asyncio.sleep(5)
+            check_n += 1
+
+            if not await self._page_alive(self._page, timeout=4):
+                log(f"DEAD tab_unresponsive check={check_n}")
+                raise BrainError("tab_dead", "tab unresponsive", self.name)
+
+            try:
+                body = await self._body_text()
+            except Exception as e:
+                log(f"DEAD body_eval {type(e).__name__}: {e}")
+                raise BrainError("tab_dead", f"{type(e).__name__}: {e}", self.name)
+
+            for phrase in AGENT_ERROR:
+                if phrase in body.lower():
+                    log(f"FAILED phrase={phrase!r}")
+                    raise BrainError("site_error", phrase, self.name)
+
+            stop = await self._first(self.done_when_gone, timeout=500) if has_stop else None
+            changed = body != last_text
+            if changed:
+                last_text = body
+                last_change = time.time()
+            elapsed_stable = time.time() - last_change
+            has_new = body != before_text
+
+            if state == "starting" and (stop or has_new):
+                state = "working"
+                log(f"TRANS starting->working stop={bool(stop)} new={has_new}")
+
+            if has_stop:
+                if stop:
+                    no_stop_since = None
+                    if state == "working" and elapsed_stable >= 30:
+                        state = "thinking"
+                        log(f"TRANS working->thinking stable={int(elapsed_stable)}s")
+                    continue
+                if no_stop_since is None:
+                    no_stop_since = time.time()
+                no_stop_elapsed = time.time() - no_stop_since
+                if has_new and no_stop_elapsed >= 30 and elapsed_stable >= 15:
+                    last = await self._last_assistant_text()
+                    if last and not self._is_status(last):
+                        log(f"DONE stop_gone={int(no_stop_elapsed)}s stable={int(elapsed_stable)}s")
+                        return
+                if not has_new and no_stop_elapsed >= 60:
+                    log(f"STUCK no_content stop_gone={int(no_stop_elapsed)}s")
+                    raise BrainError("no_reply", "stop gone, no content", self.name)
             else:
-                stable, last_text = 0, now
-            if stop is None and stable >= 2:
-                last = await self._last_assistant_text()
-                if last and not self._is_status(last):
-                    return
-            if stable >= 5 and not self._is_status(await self._last_assistant_text()):
-                return
-        raise BrainError("agent_timeout", "agent did not finish", self.name)
+                if has_new and elapsed_stable >= 15:
+                    last = await self._last_assistant_text()
+                    if last and not self._is_status(last):
+                        log(f"DONE text_stable={int(elapsed_stable)}s")
+                        return
+                if not has_new and (time.time() - last_change) >= 120:
+                    log(f"STUCK no_content stable={int(time.time()-last_change)}s")
+                    raise BrainError("no_reply", "no reply after 120s", self.name)
+
+        log(f"TIMEOUT state={state} elapsed={deadline_s}s")
+        raise BrainError("agent_timeout", f"agent did not finish in {deadline_s}s", self.name)
 
     async def _wait_reply(self, before_text):
         if self.mode == "agent":

@@ -12,3 +12,4 @@ telemetry.jsonl
 shot*.png
 profile/
 profile.bak-*/
+logs/

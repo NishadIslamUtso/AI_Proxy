@@ -144,6 +144,7 @@ brains:
   arena-agent:
     url: "https://arena.ai/agent"
     mode: agent
+    agent_deadline: 7200
     input_selectors:
       - ".tiptap.ProseMirror"
       - "div.tiptap[contenteditable='true']"
