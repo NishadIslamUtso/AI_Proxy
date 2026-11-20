@@ -18,7 +18,7 @@ helper:
     HERMES_PROXY_GUARD: "1"
     HERMES_MODEL_PROVIDER: "nous"
     HERMES_MODEL_DEFAULT: "qwen/qwen4-max:free"
-  cli_timeout_seconds: 120
+  cli_timeout_seconds: 240
   role_prompt: |
     You are a helper subprocess inside an agent framework.
     Rules, enforced:
@@ -97,9 +97,9 @@ brains:
       - "div.tiptap[contenteditable='true']"
       - "main div[contenteditable='true']"
     response_selectors:
-      - "main .prose:not(.tiptap)"
-      - "main [data-message-role='assistant'] .prose"
-      - "main .prose:not(.tiptap) > div > div > div"
+      - "div:not(.bg-surface-raised):not(.editor-content) > .prose:not(.tiptap)"
+      - "main .prose.prose-sm:not(.tiptap)"
+      - ".prose.prose-sm:not(.tiptap)"
     submit_selectors:
       - "button[aria-label='Send message']"
       - "button[aria-label*='Send']"

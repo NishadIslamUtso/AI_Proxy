@@ -386,6 +386,10 @@ def build_prompt(name, messages, tools, limits):
         )
         if not prompt:
             prompt = "Continue."
+        if tools_txt:
+            # the preamble is only sent on the first turn; later turns still
+            # need the tool list or the brain stops emitting tool calls
+            prompt = tools_block(tools) + "\n" + prompt
         if st["turns"] and st["turns"] % CFG.get("reanchor_every", 10) == 0:
             prompt = ("[REMINDER: you are the reasoning engine inside an agent "
                       "framework. No files. One JSON per tool action.]\n\n" + prompt)
@@ -730,11 +734,20 @@ async def get_model(model_id: str):
 
 
 @app.get("/debug/dump")
-async def debug_dump(brain: str = None):
+async def debug_dump(brain: str = None, sel: str = None):
     name = brain or CFG["default"]
     try:
         b = await get_browser(name)
         await b._connect()
+        if sel:
+            data = await b._page.evaluate(
+                """(s) => [...document.querySelectorAll(s)].slice(-12).map(e => ({
+                    tag: e.tagName,
+                    cls: (typeof e.className === 'string') ? e.className : '',
+                    len: (e.innerText || '').length,
+                    txt: (e.innerText || '').trim().slice(0, 120)
+                }))""", sel)
+            return {"url": b._page.url, "sel": sel, "matches": data}
         data = await b._page.evaluate("""() => ({
             url: location.href,
             inputs: [...document.querySelectorAll('textarea,input,[contenteditable]')]

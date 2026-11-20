@@ -5,8 +5,10 @@ into something that behaves like a model endpoint. One instance per brain.
 """
 import asyncio
 import hashlib
+import math as _math
 import os
 import random
+import random as _random
 import re
 import time
 import uuid
@@ -76,6 +78,9 @@ class BrainBrowser:
         self.auth_selectors = cfg.get("auth_selectors", [])
         self.strip_patterns = cfg.get("strip_patterns") or []
         self.paused = False
+        self._human = None
+        self._last_activity = time.time()
+        self._idle_task = None
         self.file_input_selectors = cfg.get("file_input_selectors") or ["input[type='file']"]
 
         self.user_data_dir = browser_cfg["user_data_dir"]
@@ -436,33 +441,104 @@ class BrainBrowser:
             return (await el.input_value()) or ""
         return (await el.inner_text()) or ""
 
+    async def _human_type(self, el, prompt):
+        """Type like a person, but bounded.
+
+        A real Hermes turn carries an 8k-char prompt. At 65ms/char that is
+        nine minutes of typing, which blows every timeout in the stack. So
+        short prompts are typed key-by-key; long ones get a human-typed
+        opening and the remainder pasted in chunks - pasting long text is
+        itself ordinary human behaviour.
+        """
+        tag = (await el.evaluate("e => e.tagName")).lower()
+        if tag in ("textarea", "input") and len(prompt) > 400:
+            await el.fill(prompt)
+            return
+
+        typed_budget = 120 if len(prompt) > 400 else len(prompt)
+        head, rest = prompt[:typed_budget], prompt[typed_budget:]
+
+        for i, ch in enumerate(head):
+            await self._page.keyboard.insert_text(ch)
+            d = _random.gauss(0.065, 0.025)
+            d = max(0.025, min(0.15, d))
+            if ch in " .,;:!?\n":
+                d += _random.uniform(0.05, 0.25)
+            if i > 0 and i % _random.randint(40, 120) == 0:
+                d += _random.uniform(0.4, 1.8)
+            await asyncio.sleep(d)
+
+        while rest:
+            n = _random.randint(400, 900)
+            chunk, rest = rest[:n], rest[n:]
+            await self._page.keyboard.insert_text(chunk)
+            await asyncio.sleep(_random.uniform(0.25, 0.9))
+
     async def _type_and_send(self, el, prompt):
         _gap = time.time() - self.last_send
         if _gap < self.min_gap:
             await asyncio.sleep(self.min_gap - _gap + random.uniform(0, 2))
-        self.last_send = time.time()
         await self._dismiss_safe_dialogs()
-        await el.click()
+
+        # reading dwell before touching the composer
+        await asyncio.sleep(_random.uniform(0.8, 2.5))
+
+        # approach the composer along a path, overshoot, then correct
+        try:
+            box = await el.bounding_box()
+            if box:
+                tx = box["x"] + box["width"] * _random.uniform(0.3, 0.7)
+                ty = box["y"] + box["height"] * _random.uniform(0.4, 0.7)
+                await self._page.mouse.move(
+                    tx + _random.uniform(-80, 80),
+                    ty + _random.uniform(-60, 60),
+                    steps=_random.randint(8, 18),
+                )
+                await asyncio.sleep(_random.uniform(0.15, 0.4))
+                await self._page.mouse.move(tx, ty, steps=_random.randint(3, 8))
+        except Exception:
+            pass
+
+        # press with a real hold, not a zero-duration click
+        try:
+            await self._page.mouse.down()
+            await asyncio.sleep(_random.uniform(0.05, 0.18))
+            await self._page.mouse.up()
+        except Exception:
+            await el.click()
+        await asyncio.sleep(_random.uniform(0.2, 0.5))
+
         await self._page.keyboard.press("Control+A")
+        await asyncio.sleep(_random.uniform(0.1, 0.3))
         await self._page.keyboard.press("Delete")
-        tag = (await el.evaluate("e => e.tagName")).lower()
-        if tag in ("textarea", "input"):
-            await el.fill(prompt)
-        else:
-            await self._page.keyboard.insert_text(prompt)
+        await asyncio.sleep(_random.uniform(0.2, 0.6))
+
+        await self._human_type(el, prompt)
+
         await asyncio.sleep(0.3)
+        for _ in range(8):
+            if (await self._composer_text(el)).strip():
+                break
+            await asyncio.sleep(0.5)
         if not (await self._composer_text(el)).strip():
             raise BrainError("send_failed", "composer empty after typing", self.name)
+
+        # re-read before sending
+        await asyncio.sleep(_random.uniform(0.5, 1.8))
         await self._page.keyboard.press(self.submit_key or "Enter")
         for _ in range(6):
             await asyncio.sleep(0.5)
             if not (await self._composer_text(el)).strip():
+                self.last_send = time.time()
+                self._start_idle_wander()
                 return
         btn = await self._first(self.submit_selectors, timeout=1000)
         if btn:
             await btn.click()
             await asyncio.sleep(1)
             if not (await self._composer_text(el)).strip():
+                self.last_send = time.time()
+                self._start_idle_wander()
                 return
         await self._page.evaluate(
             "() => { const f = document.querySelector('form'); if (f) f.requestSubmit(); }"
@@ -470,6 +546,31 @@ class BrainBrowser:
         await asyncio.sleep(1)
         if (await self._composer_text(el)).strip():
             raise BrainError("send_failed", "could not submit", self.name)
+
+    def _start_idle_wander(self):
+        """Background idle movement between turns.
+
+        Drifts the mouse and scrolls a little so the tab does not look like
+        a headless puppet between calls. Fire-and-forget, never blocks.
+        """
+        asyncio.create_task(self._idle_wander())
+
+    async def _idle_wander(self):
+        try:
+            await asyncio.sleep(_random.uniform(1.0, 3.0))
+            w = await self._page.evaluate("() => window.innerWidth")
+            h = await self._page.evaluate("() => window.innerHeight")
+            for _ in range(_random.randint(1, 3)):
+                await self._page.mouse.move(
+                    _random.randint(int(w * 0.1), int(w * 0.9)),
+                    _random.randint(int(h * 0.1), int(h * 0.9)),
+                    steps=_random.randint(5, 15),
+                )
+                await asyncio.sleep(_random.uniform(0.4, 1.2))
+            await self._page.mouse.wheel(
+                0, _random.choice([-1, 1]) * _random.randint(80, 300))
+        except Exception:
+            pass
 
     def _is_status(self, text):
         t = (text or "").strip().lower()
@@ -642,21 +743,25 @@ class BrainBrowser:
                     continue
             return ""
         after = await self._body_text()
-        # Preferred: everything after the marker we appended to the prompt.
+        # Preferred: an explicit response bubble. More precise than "everything
+        # after the marker", which also sweeps up vote buttons and page chrome.
+        for sel in self.response_selectors:
+            try:
+                loc = self._page.locator(sel)
+                n = await loc.count()
+                if n:
+                    text = (await loc.nth(n - 1).inner_text()).strip()
+                    if text:
+                        return self._clean(text)
+            except Exception:
+                continue
+        # Fallback: everything after the marker we appended to the prompt.
         marker = getattr(self, "_marker", None)
         if marker:
             idx = after.rfind(marker)
             if idx >= 0:
                 tail = after[idx + len(marker):]
                 return self._clean(tail)
-        for sel in self.response_selectors:
-            try:
-                loc = self._page.locator(sel)
-                n = await loc.count()
-                if n:
-                    return self._clean((await loc.nth(n - 1).inner_text()).strip())
-            except Exception:
-                continue
         if after.startswith(before_text):
             return self._clean(after[len(before_text):].strip())
         return self._clean(after.strip())
@@ -875,11 +980,29 @@ class BrainBrowser:
             el = await self._composer_ready()
             if el is None:
                 raise BrainError("no_reply", f"no composer on {self._page.url}", self.name)
-            if (await self._composer_text(el)).strip():
-                raise BrainError("user_tab_busy",
-                                 f"{self.name}: composer already has text", self.name)
+            cur = (await self._composer_text(el)).strip()
+            if cur:
+                prev = getattr(self, "_last_typed", "") or ""
+                ours = bool(prev and (cur in prev or prev.startswith(cur[:80])))
+                if not ours:
+                    # our prompts carry a marker and a distinctive preamble
+                    ours = bool(
+                        re.search(r"\bBR[0-9A-F]{8}\b", cur)
+                        or "reasoning engine inside an agent framework" in cur.lower()
+                        or cur.startswith("[BRAIN PROXY]")
+                    )
+                if not ours and len(cur) >= 20:
+                    # long enough to be a person mid-message - leave it alone
+                    raise BrainError("user_tab_busy",
+                                     f"{self.name}: composer already has text", self.name)
+                # ours, or a stray keystroke: clear and continue
+                await el.click()
+                await self._page.keyboard.press("Control+A")
+                await self._page.keyboard.press("Delete")
+                await asyncio.sleep(0.3)
             try:
-                await self._type_and_send(el, prompt + note + "\n\n" + self._marker)
+                self._last_typed = prompt + note + "\n\n" + self._marker
+                await self._type_and_send(el, self._last_typed)
                 if files:
                     await self._attach(files)
             except BrainError:
