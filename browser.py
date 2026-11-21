@@ -131,6 +131,10 @@ IGNORE_DEFAULT_ARGS = ["--disable-blink-features=AutomationControlled"]
 # Playwright does not add itself is a potential automation tell.
 LAUNCH_ARGS = []
 
+# Sent once when a brand-new client session gets its own thread, so the site
+# actually creates the conversation and hands back a link we can save.
+DEFAULT_WARMUP = "Say exactly: session ready."
+
 
 class BrainBrowser:
     def __init__(self, name, cfg, browser_cfg, recovery=None):
@@ -162,6 +166,10 @@ class BrainBrowser:
         self._cond_seen = {}
         self._run_url = ""
         self._run_key = None
+        # Sent once on a brand-new client thread so the site actually creates
+        # the conversation and hands back a link. Empty disables it.
+        self.warmup_prompt = (cfg.get("warmup_message")
+                              or DEFAULT_WARMUP).strip()
         # Seconds to wait, per attempt, when the human is typing in the
         # composer. Configurable so tests do not actually sleep.
         self.busy_wait_base = 20.0
@@ -1566,12 +1574,38 @@ class BrainBrowser:
     def _task_key(self, prompt):
         return hashlib.sha256(prompt[:400].encode("utf-8", "ignore")).hexdigest()[:16]
 
-    async def ask(self, prompt, files=None, task_id=None):
+    async def _send_warmup(self):
+        """Send the warm-up message on a fresh thread and let it finish.
+
+        This is what makes the site allocate a real conversation and give us a
+        link worth saving. Failure here is not fatal - the thread may still be
+        usable - so it only logs.
+        """
+        el = await self._composer_ready()
+        if el is None:
+            return
+        try:
+            self._last_typed = self.warmup_prompt
+            self._prev_marker = ""
+            await self._type_and_send(el, self.warmup_prompt)
+            await self._wait_reply("")
+        except Exception as e:  # noqa: BLE001
+            print(f"[brain-proxy] {self.name}: warmup failed: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            return
+        self.session_url = self._page.url
+        print(f"[brain-proxy] {self.name}: warmed up, thread "
+              f"{self.session_url}", flush=True)
+
+    async def ask(self, prompt, files=None, task_id=None, client_key=None):
         """Send one prompt to the web chat and return its reply.
 
         `task_id` identifies the *task*, not the turn. It is what lets the
         brain be resumed on the thread that belongs to this task instead of
         whichever thread was open last.
+
+        `client_key` identifies the *client session* (a Hermes session, or a
+        manual slot). A client gets its own thread, created on first contact.
         """
         if self.paused:
             raise BrainError("paused", f"{self.name} is paused by user", self.name)
@@ -1579,7 +1613,7 @@ class BrainBrowser:
         busy_waits = 0
         for attempt in range(4):
             try:
-                reply = await self._ask_once(prompt, files, task_id)
+                reply = await self._ask_once(prompt, files, task_id, client_key)
                 self.breaker.ok()
                 return reply
             except BrainError as e:
@@ -1617,7 +1651,7 @@ class BrainBrowser:
                 raise BrainError(code, f"{type(e).__name__}: {e}", self.name)
         raise BrainError(classify(last) if last else "no_reply", str(last), self.name)
 
-    async def _ask_once(self, prompt, files=None, task_id=None):
+    async def _ask_once(self, prompt, files=None, task_id=None, client_key=None):
         async with self._lock:
             _t0 = time.time()
 
@@ -1645,7 +1679,7 @@ class BrainBrowser:
             # Since session_url is set after every successful turn, the
             # mapping was never consulted again and every new task silently
             # continued in the previous task's thread.
-            key = task_id or self._task_key(prompt)
+            key = client_key or task_id or self._task_key(prompt)
             wanted = self.sessions.get(key, "")
             if wanted:
                 if wanted != self.session_url:
@@ -1657,16 +1691,20 @@ class BrainBrowser:
                         raise
                     except Exception as e:  # noqa: BLE001
                         raise BrainError(classify(e), str(e), self.name)
-            elif self.session_url:
-                # A new task must not inherit whichever thread happens to be
-                # open. Without this, two different Hermes sessions that
-                # arrive while the same thread is open share one conversation -
-                # which is exactly what the user saw.
-                print(f"[brain-proxy] {self.name}: new task '{key}', "
+            elif self.session_url or self.ready:
+                # A brand-new client gets its own thread rather than inheriting
+                # whichever one happens to be open - that is how two Hermes
+                # sessions used to end up sharing a conversation.
+                print(f"[brain-proxy] {self.name}: new client '{key}', "
                       f"starting its own thread", flush=True)
                 await self.new_thread()
                 await self._guard_ui()
                 before = await self._body_text()
+                if self.warmup_prompt:
+                    await self._send_warmup()
+                    before = await self._body_text()
+                self.sessions[key] = self.session_url
+                self._save_learned()
 
             # Snapshot the response bubbles so we can later prove that the
             # reply we extract is new and not the previous turn's answer.

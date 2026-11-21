@@ -85,7 +85,7 @@ def _patch_brain(monkeypatch, mod, replies):
     calls = []
 
     async def fake_brain_call(name, prompt, max_wait=None, files=None,
-                              task_id=None):
+                              task_id=None, client_key=None):
         calls.append(prompt)
         r = replies[min(len(calls) - 1, len(replies) - 1)]
         if isinstance(r, Exception):
@@ -367,7 +367,7 @@ class TestBreakerRecovery:
 
         monkeypatch.setattr(b, "browser_needs_relaunch", dead)
 
-        async def fake_ask(prompt, files=None, task_id=None):
+        async def fake_ask(prompt, files=None, task_id=None, client_key=None):
             return "back"
 
         monkeypatch.setattr(b, "ask", fake_ask)
@@ -391,7 +391,7 @@ class TestBreakerRecovery:
 
         asked = []
 
-        async def fake_ask(prompt, files=None, task_id=None):
+        async def fake_ask(prompt, files=None, task_id=None, client_key=None):
             asked.append(1)
             return "x"
 
@@ -432,7 +432,7 @@ class TestSessionSlots:
         mod = app_mod
         b = asyncio.run(mod.get_browser("chatgpt"))
 
-        async def fake_ask(prompt, files=None, task_id=None):
+        async def fake_ask(prompt, files=None, task_id=None, client_key=None):
             return "ok"
 
         monkeypatch.setattr(b, "ask", fake_ask)
@@ -458,6 +458,7 @@ class _FakeReq:
 
     def __init__(self, body):
         self._body = body
+        self.headers = {}
 
     async def json(self):
         return self._body

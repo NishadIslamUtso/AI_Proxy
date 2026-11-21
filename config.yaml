@@ -75,10 +75,9 @@ max_wait_seconds: 120
 recovery: []
 
 # How many extra session slots each brain exposes, as `<brain>#2`, `<brain>#3`.
-# A slot is a manual handle on a thread: two clients on different slots never
-# share a conversation, which is how you keep one Hermes session apart from
-# another. 0 disables the aliases.
-session_slots: 3
+# Off by default: one model per brain, and the session<->link mapping is done in
+# the control page rather than by multiplying the model list.
+session_slots: 0
 
 # The browser the proxy drives. Dedicated profile + dedicated CDP port so it
 # never fights Hermes's own browser (which is on 9222).

@@ -252,6 +252,65 @@ def task_id(messages, prefix=""):
 
 SLOT_SEP = "#"
 
+# Hermes can be told to send its own session id as a header (see
+# providers.<name>.session_affinity_header). That is what lets the proxy know
+# exactly which Hermes session is calling, instead of guessing from the first
+# message.
+SESSION_HEADER = "x-hermes-session"
+REGISTRY_FILE = ROOT / "sessions.json"
+
+
+def load_registry():
+    try:
+        return json.loads(REGISTRY_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_registry(reg):
+    try:
+        REGISTRY_FILE.write_text(json.dumps(reg, indent=2), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        print(f"[brain-proxy] could not save the session registry: {e}",
+              flush=True)
+
+
+def client_key_for(request, messages, slot):
+    """Which client session is calling, and the key its thread is stored under.
+
+    Preference order:
+      1. Hermes' own session id, sent as a header when the provider opts in -
+         exact, and free.
+      2. A manual slot (`chatgpt#2`) - exact when you pick it by hand.
+      3. A hash of the task's first message - last resort, and the reason two
+         sessions that open with the same words used to share one thread.
+    """
+    hs = (request.headers.get(SESSION_HEADER) or "").strip()
+    if hs:
+        return "h:" + hs[:64], hs, "hermes"
+    if slot:
+        return "slot:" + slot, "", "slot"
+    return "t:" + task_id(messages), "", "task"
+
+
+def record_client(key, kind, hermes_id, brain, browser_obj):
+    """Remember that this client session exists, and which thread it owns."""
+    reg = load_registry()
+    entry = reg.get(key) or {}
+    now = time.time()
+    entry.update({
+        "brain": brain,
+        "kind": kind,
+        "hermes_session": hermes_id,
+        "thread_url": getattr(browser_obj, "session_url", "") or "",
+        "last_used": now,
+    })
+    entry.setdefault("created", now)
+    entry.setdefault("label", "")
+    reg[key] = entry
+    save_registry(reg)
+    return entry
+
 
 def resolve_model(name):
     """Split a model id into (brain, session slot).
@@ -468,7 +527,8 @@ def build_prompt(name, messages, tools, limits):
     return prompt
 
 
-async def brain_call(name, prompt, max_wait=None, files=None, task_id=None):
+async def brain_call(name, prompt, max_wait=None, files=None, task_id=None,
+                     client_key=None):
     """Call a brain, escalating through the configured fallback list."""
     if max_wait is None:
         max_wait = int(CFG.get("max_wait_seconds", 180))
@@ -508,7 +568,8 @@ async def brain_call(name, prompt, max_wait=None, files=None, task_id=None):
         t0 = time.time()
         try:
             reply = await asyncio.wait_for(
-                b.ask(prompt, files=files, task_id=task_id), timeout=max_wait)
+                b.ask(prompt, files=files, task_id=task_id,
+                      client_key=client_key), timeout=max_wait)
             record(brain, "ok", (time.time() - t0) * 1000, ok=True)
             return reply, brain
         except BrainError as e:
@@ -786,6 +847,47 @@ async def adopt_tab(request: Request):
             "adopted_url": adopted.url, "breaker": "closed"}
 
 
+@app.get("/debug/registry")
+async def get_registry():
+    """Every client session the proxy has seen, and the thread it owns."""
+    return load_registry()
+
+
+@app.post("/debug/registry")
+async def edit_registry(request: Request):
+    """Edit a registry entry: rename it, repoint it, or move it to a brain."""
+    body = await request.json()
+    key = body.get("key")
+    if not key:
+        return JSONResponse(status_code=400, content={"error": "key required"})
+    reg = load_registry()
+    entry = reg.get(key)
+    if entry is None:
+        return JSONResponse(status_code=404, content={"error": "unknown key"})
+
+    if "remove" in body and body["remove"]:
+        reg.pop(key, None)
+        save_registry(reg)
+        return {"ok": True, "removed": key}
+
+    for field in ("label", "thread_url", "brain"):
+        if field in body:
+            entry[field] = body[field]
+
+    # Repointing the saved thread: the browser keeps its own map, so update
+    # that too or the next turn would resume the old link.
+    brain = entry.get("brain")
+    b = BROWSERS.get(brain)
+    if b is not None and entry.get("thread_url"):
+        b.sessions[key] = entry["thread_url"]
+        b.session_url = entry["thread_url"]
+        b._save_learned()
+
+    reg[key] = entry
+    save_registry(reg)
+    return {"ok": True, "entry": entry}
+
+
 @app.get("/debug/threads")
 async def list_threads():
     """The task -> thread map for every brain, for the control page."""
@@ -821,6 +923,14 @@ async def control_page():
         return JSONResponse(status_code=404,
                             content={"error": "ui.html not found"})
     return FileResponse(path, media_type="text/html")
+
+
+@app.get("/debug/page-text")
+async def page_text(brain: str):
+    """The visible page text, for diagnosing walls and picking selectors."""
+    b = await get_browser(brain)
+    await b._connect()
+    return {"url": b._page.url, "text": (await b._body_text())[:6000]}
 
 
 @app.get("/debug/state")
@@ -1015,6 +1125,7 @@ async def chat_completions(request: Request):
     tools = advertised_tools(model_name, body.get("tools"))
     prompt = build_prompt(model_name, messages, tools, limits)
     tid = task_id(messages, f"slot:{slot}" if slot else "")
+    ckey, hermes_id, ckind = client_key_for(request, messages, slot)
     print(f"[brain-proxy] -> {model_name} msgs={len(messages)} "
           f"tools={len(tools)} files={len(files)} "
           f"prompt_len={len(prompt)}", flush=True)
@@ -1045,9 +1156,15 @@ async def chat_completions(request: Request):
             await b.rotate(task_id=tid)
             STATE[model_name]["schema"] = ""
             prompt2 = build_prompt(model_name, messages, tools, limits)
-            return await asyncio.wait_for(
-                b.ask(prompt2, files=files, task_id=tid), timeout=300)
-        return await brain_call(model_name, prompt, files=files, task_id=tid)
+            reply, served = await asyncio.wait_for(
+                brain_call(model_name, prompt2, files=files, task_id=tid,
+                           client_key=ckey),
+                timeout=300)
+        else:
+            reply, served = await brain_call(model_name, prompt, files=files,
+                                             task_id=tid, client_key=ckey)
+        record_client(ckey, ckind, hermes_id, served, BROWSERS.get(served))
+        return reply, served
 
     if stream:
         async def gen():

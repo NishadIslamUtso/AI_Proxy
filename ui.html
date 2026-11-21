@@ -34,9 +34,26 @@
          border: 1px solid #30363d; color: #8b949e; }
   .tag.ok { color: #3fb950; border-color: #238636; }
   .tag.bad { color: #f85149; border-color: #6e2b28; }
+  .tag.info { color: #58a6ff; border-color: #1f6feb; }
+  button.danger { border-color: #6e2b28; color: #f85149; }
+  input, select {
+    background: #0d1117; color: #e6edf3; border: 1px solid #30363d;
+    border-radius: 6px; padding: 5px 8px; font-size: 13px; width: 100%;
+    font-family: inherit;
+  }
+  input.url { font-family: ui-monospace, Consolas, monospace; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 6px 8px 6px 0; vertical-align: top; }
+  .ses { border-top: 1px solid #21262d; padding-top: 10px; margin-top: 10px; }
+  .ses:first-child { border-top: 0; padding-top: 0; margin-top: 0; }
+  .seshead { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
+  .pair { display: grid; grid-template-columns: minmax(160px, 1fr) 2fr;
+          gap: 10px; }
+  .pair label { font-size: 12px; color: #8b949e; display: block; }
+  .pair input { margin-top: 4px; }
   code { background: #21262d; padding: 1px 5px; border-radius: 4px;
          font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
-  .hint { color: #8b949e; font-size: 12.5px; margin-top: 6px; }
+  .hint { color: #8b949e; font-size: 12.5px; margin-top: 8px; }
   h2 { font-size: 14px; margin: 0 0 10px; color: #c9d1d9; }
 </style>
 </head>
@@ -59,6 +76,16 @@
 </div>
 
 <div class="card">
+  <h2>Hermes sessions using the proxy</h2>
+  <div id="sessions"><div class="url">loading&hellip;</div></div>
+  <div class="hint">
+    One row per client session. Edit the label or the thread link and press
+    Save - useful when a site changes its link, or a conversation goes messy and
+    you want to point it at a fresh one. Remove forgets the session.
+  </div>
+</div>
+
+<div class="card">
   <h2>Brains</h2>
   <div id="brains"><div class="url">loading&hellip;</div></div>
   <div class="hint">
@@ -76,22 +103,94 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? '' : s)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const cssEsc = (s) => String(s).replace(/["\\\]]/g, '\\$&');
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
   return r.json();
 }
+const post = (path, body) => api(path, {
+  method: 'POST', headers: {'Content-Type': 'application/json'},
+  body: JSON.stringify(body || {}),
+});
 
 async function refresh() {
   try {
-    const [threads, helper, health] = await Promise.all([
-      api('/debug/threads'), api('/debug/helper'), api('/health'),
+    const [reg, threads, helper, health] = await Promise.all([
+      api('/debug/registry'), api('/debug/threads'),
+      api('/debug/helper'), api('/health'),
     ]);
 
     $('helperTag').textContent = helper.enabled ? 'on' : 'off';
     $('helperTag').className = 'tag ' + (helper.enabled ? 'ok' : '');
     $('helperBtn').textContent = helper.enabled ? 'turn off' : 'turn on';
     $('helperBtn').className = helper.enabled ? 'on' : '';
+
+    // --- client sessions -------------------------------------------------
+    const sbox = $('sessions');
+    const keys = Object.keys(reg).sort();
+    if (!keys.length) {
+      sbox.innerHTML = '<div class="url">No client session has used the proxy '
+        + 'yet. The first request from a session creates a thread, sends a '
+        + 'warm-up and records the link.</div>';
+    } else {
+      sbox.innerHTML = '';
+      for (const k of keys) {
+        const e = reg[k];
+        const wrap = document.createElement('div');
+        wrap.className = 'ses';
+        wrap.innerHTML =
+          '<div class="seshead">' +
+            '<span class="tag ' + (e.kind === 'hermes' ? 'info' : '') + '">' +
+              esc(e.kind || 'task') + '</span>' +
+            '<span class="url">' + esc(k) + '</span>' +
+          '</div>' +
+          '<div class="pair">' +
+            '<label>Hermes session' +
+              '<input data-f="label" data-key="' + esc(k) + '" value="' +
+              esc(e.label || '') + '" placeholder="' + esc(k) + '"></label>' +
+            '<label>Connected link' +
+              '<input data-f="thread_url" data-key="' + esc(k) +
+              '" class="url" value="' + esc(e.thread_url || '') +
+              '" placeholder="paste a thread link to use instead"></label>' +
+          '</div>' +
+          '<div class="row" style="margin-top:8px">' +
+            '<button data-act="save" data-key="' + esc(k) + '">save</button>' +
+            '<button data-act="new" data-key="' + esc(k) + '">start a new thread</button>' +
+            '<div class="grow"></div>' +
+            '<button data-act="del" data-key="' + esc(k) + '" class="danger">remove</button>' +
+          '</div>' +
+          '<div class="hint">first used ' + esc(new Date((e.created || 0) * 1000).toLocaleString()) +
+            ' · last used ' + esc(new Date((e.last_used || 0) * 1000).toLocaleString()) +
+            (e.brain ? ' · brain ' + esc(e.brain) : '') + '</div>';
+        sbox.appendChild(wrap);
+      }
+      sbox.querySelectorAll('button[data-act]').forEach((b) => {
+        b.onclick = async () => {
+          const k = b.dataset.key;
+          const entry = reg[k] || {};
+          const vals = {};
+          sbox.querySelectorAll('[data-key="' + cssEsc(k) + '"]').forEach((el) => {
+            if (el.dataset.f) vals[el.dataset.f] = el.value;
+          });
+          b.disabled = true;
+          try {
+            if (b.dataset.act === 'del') {
+              if (!confirm('Forget this session? Its thread stays on the site.')) return;
+              await post('/debug/registry', {key: k, remove: true});
+            } else if (b.dataset.act === 'new') {
+              await post('/debug/new-thread', {brain: entry.brain});
+            } else {
+              await post('/debug/registry', Object.assign({key: k}, vals));
+            }
+          } finally {
+            await refresh();
+          }
+        };
+      });
+    }
 
     const box = $('brains');
     box.innerHTML = '';
@@ -127,9 +226,10 @@ async function refresh() {
     const circuits = Object.entries(health.circuits || {});
     $('status').textContent =
       'proxy up: ' + (health.ok ? 'yes' : 'no') +
+      ' · clients seen: ' + keys.length +
       ' · brains loaded: ' + (health.brains || []).length +
-      ' · benched: ' + circuits.filter(([, v]) => v.state === 'open')
-                               .map(([k]) => k).join(', ');
+      ' · benched: ' + (circuits.filter(([, v]) => v.state === 'open')
+                               .map(([k]) => k).join(', ') || 'none');
   } catch (e) {
     $('status').textContent = 'proxy not reachable: ' + e;
   }

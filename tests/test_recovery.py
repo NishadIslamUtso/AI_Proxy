@@ -330,7 +330,7 @@ class TestHumanIntervention:
 
         calls = []
 
-        async def fake(prompt, files=None, task_id=None):
+        async def fake(prompt, files=None, task_id=None, client_key=None):
             calls.append(1)
             if len(calls) <= failures:
                 raise BrainError("user_tab_busy", "composer in use", "arena-agent")

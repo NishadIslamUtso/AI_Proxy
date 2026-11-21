@@ -11,6 +11,8 @@ last-tools-block.txt
 telemetry.jsonl
 # per-brain session URLs and learned selectors - machine local, never commit
 learned.json
+# per-client session registry: which Hermes session owns which thread
+sessions.json
 shot*.png
 profile/
 profile.bak-*/
