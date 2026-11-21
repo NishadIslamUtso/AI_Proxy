@@ -119,6 +119,32 @@ by default).
   fingerprints (Brave prints a warning banner for either), so `navigator.webdriver`
   is hidden with an init script instead, which leaves nothing in the command line.
 
+## Control page
+
+Open **http://127.0.0.1:8000/ui** in a browser while the proxy is running. It
+shows every brain, its current thread and whether it is benched, and lets you:
+
+- turn the **helper** (Nous fallback) on and off, live;
+- start a **new thread** for any brain;
+- see the overall status.
+
+It is a web page, not a desktop app, so it is only there while the proxy runs.
+
+## Keeping sessions apart
+
+Each brain keeps one thread per task, and a new task starts its own thread
+rather than inheriting whichever one is open - so two conversations do not
+collide. If you want to force a separation by hand, every brain is also
+available as a **session slot**:
+
+```
+chatgpt     chatgpt#2     chatgpt#3     chatgpt#4
+```
+
+Pick a different slot for each Hermes session and they can never share a
+thread, even if their first message is identical. Set `session_slots:` in
+`config.yaml` to change how many slots exist (0 disables the aliases).
+
 ## Debugging
 
 ```bash

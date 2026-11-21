@@ -22,7 +22,7 @@ from pathlib import Path
 import uvicorn
 import yaml
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from brainjson import parse_brain_reply
 from brainjson import extract_json_objects as brainjson_objects
@@ -234,16 +234,51 @@ def format_conversation(messages, limits):
     )
 
 
-def task_id(messages):
+def task_id(messages, prefix=""):
     """A stable id for the *task* behind a request.
 
     The prompt we send changes on every turn (it carries the conversation),
     so hashing the prompt produced a different key each time and the
     per-task -> thread map never matched. The original task does not change,
     so that is what identifies the task.
+
+    `prefix` separates manual session slots: two clients that pick different
+    slots get different threads even if their first message is identical.
     """
     first = first_user_message(messages)
-    return hashlib.sha256(first[:400].encode("utf-8", "ignore")).hexdigest()[:16]
+    raw = (prefix + "|" + first[:400]) if prefix else first[:400]
+    return hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()[:16]
+
+
+SLOT_SEP = "#"
+
+
+def resolve_model(name):
+    """Split a model id into (brain, session slot).
+
+      'chatgpt'   -> ('chatgpt', '')
+      'chatgpt#2' -> ('chatgpt', '2')
+
+    The slot is a manual handle on a thread, so two Hermes sessions that pick
+    different slots never share a conversation - whatever their first message.
+    """
+    name = name or ""
+    if SLOT_SEP in name:
+        brain, _, slot = name.partition(SLOT_SEP)
+        if brain in CFG["brains"] and slot:
+            return brain, slot
+    return name, ""
+
+
+def slot_models():
+    """Every model id a client may ask for: base names plus session slots."""
+    out = []
+    slots = int(CFG.get("session_slots", 0) or 0)
+    for name in CFG["brains"]:
+        out.append(name)
+        for i in range(2, slots + 2):
+            out.append(f"{name}{SLOT_SEP}{i}")
+    return out
 
 
 def first_user_message(messages):
@@ -686,6 +721,27 @@ async def tool_test(brain: str):
                             content={"error": f"{type(e).__name__}: {e}"})
 
 
+@app.get("/debug/helper")
+async def get_helper():
+    h = CFG.get("helper") or {}
+    return {
+        "enabled": bool(h.get("enabled")),
+        "mode": h.get("mode", ""),
+        "configured": bool(h.get("cli_argv")),
+        "timeout": h.get("cli_timeout_seconds"),
+    }
+
+
+@app.post("/debug/helper")
+async def set_helper(request: Request):
+    """Turn the helper on or off at runtime - no restart needed."""
+    body = await request.json()
+    h = CFG.setdefault("helper", {})
+    if "enabled" in body:
+        h["enabled"] = bool(body["enabled"])
+    return {"enabled": bool(h.get("enabled"))}
+
+
 @app.post("/debug/pause")
 async def pause_brain(request: Request):
     body = await request.json()
@@ -728,6 +784,43 @@ async def adopt_tab(request: Request):
     b._save_learned()
     return {"ok": True, "brain": name, "paused": False,
             "adopted_url": adopted.url, "breaker": "closed"}
+
+
+@app.get("/debug/threads")
+async def list_threads():
+    """The task -> thread map for every brain, for the control page."""
+    out = {}
+    for name, b in BROWSERS.items():
+        out[name] = {
+            "session_url": getattr(b, "session_url", ""),
+            "tasks": dict(getattr(b, "sessions", {}) or {}),
+            "breaker": b.breaker.as_dict(),
+        }
+    return out
+
+
+@app.post("/debug/new-thread")
+async def start_new_thread(request: Request):
+    body = await request.json()
+    name = body.get("brain")
+    if name not in CFG["brains"]:
+        return JSONResponse(status_code=404, content={"error": "unknown brain"})
+    b = await get_browser(name)
+    await b.new_thread()
+    key = body.get("task_id")
+    if key:
+        b.sessions.pop(key, None)
+    b._save_learned()
+    return {"ok": True, "brain": name, "session_url": b.session_url}
+
+
+@app.get("/ui")
+async def control_page():
+    path = ROOT / "ui.html"
+    if not path.exists():
+        return JSONResponse(status_code=404,
+                            content={"error": "ui.html not found"})
+    return FileResponse(path, media_type="text/html")
 
 
 @app.get("/debug/state")
@@ -845,7 +938,7 @@ async def list_models():
     return {
         "object": "list",
         "data": [{"id": n, "object": "model", "owned_by": "brain-proxy"}
-                 for n in CFG["brains"]],
+                 for n in slot_models()],
     }
 
 
@@ -911,16 +1004,17 @@ async def chat_completions(request: Request):
     if not messages:
         return err(400, "messages required")
 
-    model_name = body.get("model") or CFG.get("default") or ""
+    requested = body.get("model") or CFG.get("default") or ""
+    model_name, slot = resolve_model(requested)
     if model_name not in CFG["brains"]:
-        return err(404, f"model '{model_name}' not found", code="model_not_found")
+        return err(404, f"model '{requested}' not found", code="model_not_found")
 
     stream = bool(body.get("stream"))
     limits = CFG.get("tool_truncation", {})
     files = extract_files(messages)
     tools = advertised_tools(model_name, body.get("tools"))
     prompt = build_prompt(model_name, messages, tools, limits)
-    tid = task_id(messages)
+    tid = task_id(messages, f"slot:{slot}" if slot else "")
     print(f"[brain-proxy] -> {model_name} msgs={len(messages)} "
           f"tools={len(tools)} files={len(files)} "
           f"prompt_len={len(prompt)}", flush=True)

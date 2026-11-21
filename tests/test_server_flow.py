@@ -57,6 +57,9 @@ def app_mod(monkeypatch):
         return None
 
     monkeypatch.setattr(server, "call_helper", _no_helper)
+    # BROWSERS is a module global; without clearing it a breaker left open by
+    # one test would bench the brain for the next.
+    server.BROWSERS.clear()
 
     return server
 
@@ -398,6 +401,56 @@ class TestBreakerRecovery:
             mod.chat_completions(_FakeReq(_request_body()))))
         assert out.get("error", {}).get("code") == "circuit_open"
         assert asked == []
+
+
+class TestSessionSlots:
+    """A slot is a manual handle on a thread, to separate Hermes sessions."""
+
+    def test_a_plain_name_has_no_slot(self, app_mod):
+        assert app_mod.resolve_model("chatgpt") == ("chatgpt", "")
+
+    def test_a_slot_is_split_from_the_brain(self, app_mod):
+        assert app_mod.resolve_model("chatgpt#2") == ("chatgpt", "2")
+
+    def test_an_unknown_brain_is_left_alone(self, app_mod):
+        assert app_mod.resolve_model("nope#2") == ("nope#2", "")
+
+    def test_slots_are_advertised_as_models(self, app_mod, monkeypatch):
+        monkeypatch.setitem(app_mod.CFG, "session_slots", 2)
+        ids = list(app_mod.slot_models())
+        assert "chatgpt" in ids
+        assert "chatgpt#2" in ids
+        assert "chatgpt#3" in ids
+
+    def test_different_slots_get_different_task_ids(self, app_mod):
+        msgs = [{"role": "user", "content": "hola"}]
+        assert app_mod.task_id(msgs, "slot:2") != app_mod.task_id(msgs, "slot:3")
+        assert app_mod.task_id(msgs, "slot:2") != app_mod.task_id(msgs)
+
+    def test_a_slot_request_still_routes_to_its_brain(self, app_mod,
+                                                      monkeypatch):
+        mod = app_mod
+        b = asyncio.run(mod.get_browser("chatgpt"))
+
+        async def fake_ask(prompt, files=None, task_id=None):
+            return "ok"
+
+        monkeypatch.setattr(b, "ask", fake_ask)
+        out = _body(asyncio.run(
+            mod.chat_completions(_FakeReq(_request_body(model="chatgpt#2")))))
+        assert "choices" in out, out
+
+
+class TestHelperToggle:
+    def test_a_disabled_helper_returns_none(self, app_mod, monkeypatch):
+        monkeypatch.setitem(app_mod.CFG["helper"], "enabled", False)
+        out = asyncio.run(
+            app_mod.call_helper([{"role": "user", "content": "x"}]))
+        assert out is None
+
+    def test_the_helper_is_configured_and_on(self, app_mod):
+        assert app_mod.CFG["helper"]["enabled"] is True
+        assert app_mod.CFG["helper"]["cli_argv"]
 
 
 class _FakeReq:

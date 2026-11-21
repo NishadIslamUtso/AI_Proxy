@@ -954,11 +954,11 @@ class BrainBrowser:
     async def _human_type(self, el, prompt):
         """Type like a person, but bounded.
 
-        A real Hermes turn carries an 8k-char prompt. At 65ms/char that is
-        nine minutes of typing, which blows every timeout in the stack. So
-        short prompts are typed key-by-key; long ones get a human-typed
-        opening and the remainder pasted in chunks - pasting long text is
-        itself ordinary human behaviour.
+        A Hermes turn normally carries the whole conversation, so the prompt is
+        long. Key-by-key at 70ms a character is half a minute of typing, which
+        is what made every turn feel stuck. Chunked input with light jitter
+        still reads as a person typing and lands a long turn in a couple of
+        seconds.
         """
         tag = (await el.evaluate("e => e.tagName")).lower()
         if tag in ("textarea", "input") and len(prompt) > 400:
@@ -971,32 +971,35 @@ class BrainBrowser:
         for pi, part in enumerate(parts):
             if pi:
                 await self._page.keyboard.press("Shift+Enter")
-                await asyncio.sleep(_random.uniform(0.15, 0.5))
+                await asyncio.sleep(_random.uniform(0.05, 0.15))
             if not part:
                 continue
-            # small chunks, not one character at a time: per-character
-            # insert_text races the editor's own re-render and drops or
-            # reorders keystrokes, which is what produced the typos
-            step = _random.randint(6, 18)
+            step = _random.randint(24, 60)
             for i in range(0, len(part), step):
                 chunk = part[i:i + step]
                 await self._page.keyboard.insert_text(chunk)
-                d = _random.gauss(0.07, 0.03)
-                d = max(0.03, min(0.16, d))
+                d = _random.gauss(0.025, 0.012)
+                d = max(0.008, min(0.06, d))
                 if chunk[-1] in " .,;:!?\"'":
-                    d += _random.uniform(0.05, 0.22)
+                    d += _random.uniform(0.02, 0.08)
                 await asyncio.sleep(d)
-            if _random.random() < 0.12:
-                await asyncio.sleep(_random.uniform(0.3, 1.1))
+            if _random.random() < 0.10:
+                await asyncio.sleep(_random.uniform(0.1, 0.4))
 
     async def _type_and_send(self, el, prompt):
+        _t0 = time.time()
+
+        def _lap(stage):
+            print(f"[brain-proxy]   {self.name} type:{stage} "
+                  f"+{time.time() - _t0:5.1f}s", flush=True)
+
         _gap = time.time() - self.last_send
         if _gap < self.min_gap:
             await asyncio.sleep(self.min_gap - _gap + random.uniform(0, 2))
         await self._dismiss_safe_dialogs()
 
         # reading dwell before touching the composer
-        await asyncio.sleep(_random.uniform(0.8, 2.5))
+        await asyncio.sleep(_random.uniform(0.3, 0.9))
 
         # approach the composer along a path, overshoot, then correct
         try:
@@ -1029,20 +1032,22 @@ class BrainBrowser:
         await asyncio.sleep(_random.uniform(0.2, 0.6))
 
         await self._human_type(el, prompt)
+        _lap("typed")
 
-        await asyncio.sleep(0.3)
-        for _ in range(8):
+        await asyncio.sleep(0.15)
+        for _ in range(5):
             if (await self._composer_text(el)).strip():
                 break
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
         if not (await self._composer_text(el)).strip():
             raise BrainError("send_failed", "composer empty after typing", self.name)
 
         # re-read before sending
-        await asyncio.sleep(_random.uniform(0.5, 1.8))
+        await asyncio.sleep(_random.uniform(0.2, 0.6))
         await self._page.keyboard.press(self.submit_key or "Enter")
-        for _ in range(6):
-            await asyncio.sleep(0.5)
+        _lap("enter")
+        for _ in range(4):
+            await asyncio.sleep(0.3)
             if not (await self._composer_text(el)).strip():
                 self.last_send = time.time()
                 self._start_idle_wander()
@@ -1277,20 +1282,21 @@ class BrainBrowser:
                     stop_seen = True
                 elif stop_seen:
                     return
-                elif waited >= 12:
+                elif waited >= 3:
                     # No stop control ever appeared; fall back to "text
-                    # stopped changing" below.
+                    # stopped changing" below. Three seconds is plenty - a
+                    # healthy site shows its stop control within one.
                     break
-        # Fallback: text stops changing for 4s (and has actually changed).
+        # Fallback: text stops changing (and has actually changed).
         last = before_text
         stable = 0
         for _ in range(240):
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.7)
             await self._note_url_change()
             now = await self._body_text()
             if now != before_text and now == last:
                 stable += 1
-                if stable >= 4:
+                if stable >= 3:
                     return
             else:
                 stable = 0
@@ -1613,6 +1619,12 @@ class BrainBrowser:
 
     async def _ask_once(self, prompt, files=None, task_id=None):
         async with self._lock:
+            _t0 = time.time()
+
+            def _lap(stage):
+                print(f"[brain-proxy] {self.name} {stage} "
+                      f"+{time.time() - _t0:5.1f}s", flush=True)
+
             try:
                 await self._preflight()
                 await self._connect()
@@ -1620,8 +1632,10 @@ class BrainBrowser:
                 raise
             except Exception as e:  # noqa: BLE001
                 raise BrainError(classify(e), f"{type(e).__name__}: {e}", self.name)
+            _lap("connect")
 
             await self._guard_ui()
+            _lap("guard")
             before = await self._body_text()
 
             # per-task thread: same task keeps its conversation, a new task
@@ -1633,15 +1647,26 @@ class BrainBrowser:
             # continued in the previous task's thread.
             key = task_id or self._task_key(prompt)
             wanted = self.sessions.get(key, "")
-            if wanted and wanted != self.session_url:
-                try:
-                    await self._connect(url=wanted)
-                    await self._guard_ui()
-                    before = await self._body_text()
-                except BrainError:
-                    raise
-                except Exception as e:  # noqa: BLE001
-                    raise BrainError(classify(e), str(e), self.name)
+            if wanted:
+                if wanted != self.session_url:
+                    try:
+                        await self._connect(url=wanted)
+                        await self._guard_ui()
+                        before = await self._body_text()
+                    except BrainError:
+                        raise
+                    except Exception as e:  # noqa: BLE001
+                        raise BrainError(classify(e), str(e), self.name)
+            elif self.session_url:
+                # A new task must not inherit whichever thread happens to be
+                # open. Without this, two different Hermes sessions that
+                # arrive while the same thread is open share one conversation -
+                # which is exactly what the user saw.
+                print(f"[brain-proxy] {self.name}: new task '{key}', "
+                      f"starting its own thread", flush=True)
+                await self.new_thread()
+                await self._guard_ui()
+                before = await self._body_text()
 
             # Snapshot the response bubbles so we can later prove that the
             # reply we extract is new and not the previous turn's answer.
@@ -1685,6 +1710,7 @@ class BrainBrowser:
                 raise
             except Exception as e:  # noqa: BLE001
                 raise BrainError("send_failed", f"{type(e).__name__}: {e}", self.name)
+            _lap("send")
 
             for u in self.auth_urls:
                 if u in self._page.url:
@@ -1726,7 +1752,9 @@ class BrainBrowser:
             except Exception:
                 pass
 
+            _lap("wait")
             reply = await self._extract(before)
+            _lap("extract")
             self.session_url = self._page.url
             self.sessions[key] = self.session_url
             self._save_learned()
